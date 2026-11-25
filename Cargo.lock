@@ -403,6 +403,7 @@ name = "dragon-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "dragon-ai",
  "dragon-core",
@@ -441,6 +442,7 @@ dependencies = [
  "log",
  "lopdf",
  "quick-xml",
+ "serde",
  "thiserror",
  "zip",
 ]

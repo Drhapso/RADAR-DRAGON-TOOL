@@ -3,8 +3,20 @@
 //! PowerPoint (PPTX), Markdown, JSON, código fuente y texto plano.
 
 pub mod office;
+pub mod office_visual;
 pub mod pdf;
 pub mod text;
+
+pub use office::{
+    extract_docx_paragraphs, extract_pptx_slides, extract_xlsx_sheets, extract_zip_entries,
+    ArchiveEntryPreview, SheetPreview, SlidePreview,
+};
+pub use office_visual::{
+    extract_excel_visual, extract_pptx_visual, extract_word_visual, read_zip_entry_bytes,
+    ExcelCell, ExcelSheetVisual, ExcelVisualPreview, PptElement, PptParagraph, PptSlideVisual,
+    PptVisualPreview, WordBlock, WordParagraph, WordRun, WordTableCell, WordVisualPreview,
+};
+pub use pdf::{extract_pdf_preview, PdfPreview};
 
 use anyhow::Result;
 use std::path::Path;

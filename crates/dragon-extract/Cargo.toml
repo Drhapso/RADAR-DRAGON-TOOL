@@ -10,6 +10,7 @@ lopdf.workspace = true
 quick-xml.workspace = true
 zip.workspace = true
 encoding_rs.workspace = true
+serde.workspace = true
 log.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true

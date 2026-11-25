@@ -3,9 +3,33 @@
 use anyhow::{Context, Result};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use serde::Serialize;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SheetPreview {
+    pub name: String,
+    pub rows: Vec<Vec<String>>,
+    pub total_rows: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SlidePreview {
+    pub number: usize,
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArchiveEntryPreview {
+    pub path: String,
+    pub size: u64,
+    pub compressed_size: u64,
+    pub is_dir: bool,
+}
 
 /// Extrae texto plano de un documento Word (.docx), incluyendo cuerpo, encabezados, pies y comentarios.
 pub fn extract_docx_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<String> {
@@ -416,6 +440,496 @@ fn extract_xml_tags(xml: &str, target_tags: &[&str], max_chars: usize) -> Result
     Ok(output)
 }
 
+/// Extrae párrafos estructurados de un documento Word (.docx) preservando saltos de párrafo.
+pub fn extract_docx_paragraphs<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<Vec<String>> {
+    let file = File::open(path.as_ref())?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut doc_xml = archive
+        .by_name("word/document.xml")
+        .context("No se encontró word/document.xml en el paquete DOCX")?;
+    let mut xml_content = String::new();
+    doc_xml.read_to_string(&mut xml_content)?;
+    extract_xml_paragraphs(&xml_content, b"w:p", &[b"w:t", b"t"], max_chars)
+}
+
+/// Extrae diapositivas estructuradas de una presentación PowerPoint (.pptx).
+pub fn extract_pptx_slides<P: AsRef<Path>>(path: P, max_slides: usize) -> Result<Vec<SlidePreview>> {
+    let file = File::open(path.as_ref())?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let mut slide_indices: Vec<(usize, usize)> = Vec::new();
+
+    for i in 0..archive.len() {
+        let Ok(entry) = archive.by_index(i) else {
+            continue;
+        };
+        let name = entry.name();
+        if let Some(rest) = name.strip_prefix("ppt/slides/slide").and_then(|s| s.strip_suffix(".xml")) {
+            if let Ok(num) = rest.parse::<usize>() {
+                slide_indices.push((num, i));
+            }
+        }
+    }
+    slide_indices.sort_by_key(|&(num, _)| num);
+    slide_indices.truncate(max_slides);
+
+    let mut slides = Vec::with_capacity(slide_indices.len());
+    for (num, idx) in slide_indices {
+        let Ok(mut entry) = archive.by_index(idx) else {
+            continue;
+        };
+        let mut xml_content = String::new();
+        if entry.read_to_string(&mut xml_content).is_err() {
+            continue;
+        }
+        let paras = extract_xml_paragraphs(&xml_content, b"a:p", &[b"a:t", b"t"], 8_000)
+            .unwrap_or_default();
+        let title = paras
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("Diapositiva {}", num));
+        let lines = if paras.len() > 1 {
+            paras.into_iter().skip(1).collect()
+        } else {
+            Vec::new()
+        };
+        slides.push(SlidePreview {
+            number: num,
+            title,
+            lines,
+        });
+    }
+
+    Ok(slides)
+}
+
+/// Extrae hojas de cálculo (.xlsx / .xlsm) en formato tabular por hoja para vista previa.
+pub fn extract_xlsx_sheets<P: AsRef<Path>>(
+    path: P,
+    max_sheets: usize,
+    max_rows_per_sheet: usize,
+    max_cols: usize,
+) -> Result<Vec<SheetPreview>> {
+    let file = File::open(path.as_ref())?;
+    let mut archive = zip::ZipArchive::new(file)?;
+
+    // 1. Tabla sharedStrings
+    let shared_strings = if let Ok(mut shared) = archive.by_name("xl/sharedStrings.xml") {
+        let mut xml = String::new();
+        if shared.read_to_string(&mut xml).is_ok() {
+            parse_xlsx_shared_strings(&xml)
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 2. Nombres de hojas desde workbook.xml + workbook.xml.rels
+    let mut targets = resolve_xlsx_sheet_targets(&mut archive);
+    if targets.is_empty() {
+        let mut fallback: Vec<(usize, String)> = Vec::new();
+        for i in 0..archive.len() {
+            if let Ok(entry) = archive.by_index(i) {
+                let name = entry.name().to_string();
+                if let Some(rest) = name
+                    .strip_prefix("xl/worksheets/sheet")
+                    .and_then(|s| s.strip_suffix(".xml"))
+                {
+                    let ord = rest.parse::<usize>().unwrap_or(999);
+                    fallback.push((ord, name));
+                }
+            }
+        }
+        fallback.sort_by_key(|(ord, _)| *ord);
+        targets = fallback
+            .into_iter()
+            .enumerate()
+            .map(|(i, (_, p))| (format!("Hoja {}", i + 1), p))
+            .collect();
+    }
+    targets.truncate(max_sheets);
+
+    let mut sheets = Vec::with_capacity(targets.len());
+    for (sheet_name, entry_path) in targets {
+        let Ok(mut entry) = archive.by_name(&entry_path) else {
+            continue;
+        };
+        let mut xml = String::new();
+        if entry.read_to_string(&mut xml).is_err() {
+            continue;
+        }
+        let (rows, total_rows) =
+            parse_xlsx_worksheet(&xml, &shared_strings, max_rows_per_sheet, max_cols);
+        sheets.push(SheetPreview {
+            name: sheet_name,
+            rows,
+            total_rows,
+        });
+    }
+
+    Ok(sheets)
+}
+
+/// Lista las entradas de un archivo comprimido ZIP / .qlplugin / JAR / APK para vista previa.
+pub fn extract_zip_entries<P: AsRef<Path>>(
+    path: P,
+    max_entries: usize,
+) -> Result<(usize, Vec<ArchiveEntryPreview>)> {
+    let file = File::open(path.as_ref())?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    let total = archive.len();
+    let count = total.min(max_entries);
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        if let Ok(entry) = archive.by_index(i) {
+            entries.push(ArchiveEntryPreview {
+                path: entry.name().to_string(),
+                size: entry.size(),
+                compressed_size: entry.compressed_size(),
+                is_dir: entry.is_dir(),
+            });
+        }
+    }
+    Ok((total, entries))
+}
+
+fn extract_xml_paragraphs(
+    xml: &str,
+    para_tag: &[u8],
+    text_tags: &[&[u8]],
+    max_chars: usize,
+) -> Result<Vec<String>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut paragraphs = Vec::new();
+    let mut current_para = String::new();
+    let mut in_para = false;
+    let mut in_text = false;
+    let mut total_chars = 0usize;
+    let mut buf = Vec::new();
+
+    loop {
+        if total_chars >= max_chars {
+            break;
+        }
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let q = e.name();
+                let name = q.as_ref();
+                if name == para_tag {
+                    in_para = true;
+                    current_para.clear();
+                } else if in_para && text_tags.contains(&name) {
+                    in_text = true;
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let q = e.name();
+                let name = q.as_ref();
+                if name == para_tag {
+                    let trimmed = current_para.trim();
+                    if !trimmed.is_empty() {
+                        total_chars += trimmed.len();
+                        paragraphs.push(trimmed.to_string());
+                    }
+                    current_para.clear();
+                    in_para = false;
+                    in_text = false;
+                } else if text_tags.contains(&name) {
+                    in_text = false;
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if in_para && in_text {
+                    if let Ok(t) = e.unescape() {
+                        current_para.push_str(&t);
+                    }
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if in_para && in_text {
+                    current_para.push_str(&String::from_utf8_lossy(e.as_ref()));
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(paragraphs)
+}
+
+fn parse_xlsx_shared_strings(xml: &str) -> Vec<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut list = Vec::new();
+    let mut current = String::new();
+    let mut in_si = false;
+    let mut in_t = false;
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let name = e.name();
+                if name.as_ref() == b"si" {
+                    in_si = true;
+                    current.clear();
+                } else if in_si && name.as_ref() == b"t" {
+                    in_t = true;
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let name = e.name();
+                if name.as_ref() == b"si" {
+                    list.push(std::mem::take(&mut current));
+                    in_si = false;
+                    in_t = false;
+                } else if name.as_ref() == b"t" {
+                    in_t = false;
+                }
+            }
+            Ok(Event::Text(e)) if in_si && in_t => {
+                if let Ok(t) = e.unescape() {
+                    current.push_str(&t);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    list
+}
+
+fn resolve_xlsx_sheet_targets(archive: &mut zip::ZipArchive<File>) -> Vec<(String, String)> {
+    let mut rels: HashMap<String, String> = HashMap::new();
+    if let Ok(mut rel_file) = archive.by_name("xl/_rels/workbook.xml.rels") {
+        let mut xml = String::new();
+        if rel_file.read_to_string(&mut xml).is_ok() {
+            let mut reader = Reader::from_str(&xml);
+            let mut buf = Vec::new();
+            loop {
+                match reader.read_event_into(&mut buf) {
+                    Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
+                        if e.name().as_ref() == b"Relationship" =>
+                    {
+                        let mut id = String::new();
+                        let mut target = String::new();
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"Id" => id = attr.unescape_value().unwrap_or_default().to_string(),
+                                b"Target" => target = attr.unescape_value().unwrap_or_default().to_string(),
+                                _ => {}
+                            }
+                        }
+                        if !id.is_empty() && !target.is_empty() {
+                            let clean = target.trim_start_matches('/');
+                            let normalized = if clean.starts_with("xl/") {
+                                clean.to_string()
+                            } else {
+                                format!("xl/{}", clean)
+                            };
+                            rels.insert(id, normalized);
+                        }
+                    }
+                    Ok(Event::Eof) | Err(_) => break,
+                    _ => {}
+                }
+                buf.clear();
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Ok(mut wb_file) = archive.by_name("xl/workbook.xml") {
+        let mut xml = String::new();
+        if wb_file.read_to_string(&mut xml).is_ok() {
+            let mut reader = Reader::from_str(&xml);
+            let mut buf = Vec::new();
+            loop {
+                match reader.read_event_into(&mut buf) {
+                    Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e))
+                        if e.name().as_ref() == b"sheet" =>
+                    {
+                        let mut name = String::new();
+                        let mut rid = String::new();
+                        for attr in e.attributes().flatten() {
+                            let k = attr.key.as_ref();
+                            if k == b"name" {
+                                name = attr.unescape_value().unwrap_or_default().to_string();
+                            } else if k == b"r:id" || k == b"id" {
+                                rid = attr.unescape_value().unwrap_or_default().to_string();
+                            }
+                        }
+                        if let Some(target) = rels.get(&rid) {
+                            if target.contains("worksheets/") {
+                                out.push((
+                                    if name.is_empty() { "Hoja".to_string() } else { name },
+                                    target.clone(),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(Event::Eof) | Err(_) => break,
+                    _ => {}
+                }
+                buf.clear();
+            }
+        }
+    }
+    out
+}
+
+fn col_index_from_ref(cell_ref: &str) -> Option<usize> {
+    let mut col = 0usize;
+    let mut saw_alpha = false;
+    for b in cell_ref.bytes() {
+        if b.is_ascii_alphabetic() {
+            saw_alpha = true;
+            col = col * 26 + ((b.to_ascii_uppercase() - b'A') as usize + 1);
+        } else {
+            break;
+        }
+    }
+    if saw_alpha && col > 0 {
+        Some(col - 1)
+    } else {
+        None
+    }
+}
+
+fn parse_xlsx_worksheet(
+    xml: &str,
+    shared_strings: &[String],
+    max_rows: usize,
+    max_cols: usize,
+) -> (Vec<Vec<String>>, usize) {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut total_rows = 0usize;
+    let mut current_row: Vec<String> = Vec::new();
+    let mut in_row = false;
+    let mut cell_col: Option<usize> = None;
+    let mut cell_type = String::new();
+    let mut in_v = false;
+    let mut in_is = false;
+    let mut in_t = false;
+    let mut cell_buf = String::new();
+    let mut max_seen_cols = 0usize;
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let name = e.name();
+                match name.as_ref() {
+                    b"row" => {
+                        total_rows += 1;
+                        if rows.len() < max_rows {
+                            in_row = true;
+                            current_row.clear();
+                        }
+                    }
+                    b"c" if in_row => {
+                        cell_col = None;
+                        cell_type.clear();
+                        cell_buf.clear();
+                        for attr in e.attributes().flatten() {
+                            match attr.key.as_ref() {
+                                b"r" => {
+                                    let r = attr.unescape_value().unwrap_or_default();
+                                    cell_col = col_index_from_ref(&r);
+                                }
+                                b"t" => {
+                                    cell_type = attr.unescape_value().unwrap_or_default().to_string();
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    b"v" if in_row => {
+                        in_v = true;
+                        cell_buf.clear();
+                    }
+                    b"is" if in_row => {
+                        in_is = true;
+                        cell_buf.clear();
+                    }
+                    b"t" if in_row && in_is => {
+                        in_t = true;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let name = e.name();
+                match name.as_ref() {
+                    b"row" => {
+                        if in_row {
+                            if current_row.iter().any(|c| !c.is_empty()) {
+                                max_seen_cols = max_seen_cols.max(current_row.len());
+                                rows.push(std::mem::take(&mut current_row));
+                            } else {
+                                current_row.clear();
+                            }
+                            in_row = false;
+                        }
+                    }
+                    b"v" => in_v = false,
+                    b"t" => in_t = false,
+                    b"is" => in_is = false,
+                    b"c" if in_row => {
+                        let resolved = match cell_type.as_str() {
+                            "s" => cell_buf
+                                .trim()
+                                .parse::<usize>()
+                                .ok()
+                                .and_then(|i| shared_strings.get(i))
+                                .cloned()
+                                .unwrap_or_default(),
+                            "b" => {
+                                if cell_buf.trim() == "1" {
+                                    "TRUE".to_string()
+                                } else {
+                                    "FALSE".to_string()
+                                }
+                            }
+                            _ => cell_buf.trim().to_string(),
+                        };
+                        let col_idx = cell_col.unwrap_or(current_row.len());
+                        if col_idx < max_cols {
+                            if current_row.len() <= col_idx {
+                                current_row.resize(col_idx + 1, String::new());
+                            }
+                            current_row[col_idx] = resolved;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(e)) if in_row && (in_v || (in_is && in_t)) => {
+                if let Ok(t) = e.unescape() {
+                    cell_buf.push_str(&t);
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    let norm_cols = max_seen_cols.min(max_cols).max(1);
+    for row in &mut rows {
+        row.resize(norm_cols, String::new());
+    }
+    (rows, total_rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,5 +954,26 @@ mod tests {
         let mut valid = "Contrato de arrendamiento 2026".to_string();
         flush_legacy_run(&mut out, &mut valid, 4, 2, 500);
         assert_eq!(out, "Contrato de arrendamiento 2026");
+    }
+
+    #[test]
+    fn col_index_and_xlsx_worksheet_parse_cells_in_position() {
+        assert_eq!(col_index_from_ref("A1"), Some(0));
+        assert_eq!(col_index_from_ref("C12"), Some(2));
+        assert_eq!(col_index_from_ref("AA5"), Some(26));
+
+        let shared = parse_xlsx_shared_strings(
+            r#"<sst><si><t>Producto</t></si><si><t>Total</t></si></sst>"#,
+        );
+        assert_eq!(shared, vec!["Producto", "Total"]);
+
+        let sheet_xml = r#"<worksheet><sheetData>
+            <row r="1"><c r="A1" t="s"><v>0</v></c><c r="C1" t="s"><v>1</v></c></row>
+            <row r="2"><c r="A2" t="inlineStr"><is><t>Laptop</t></is></c><c r="C2"><v>1500</v></c></row>
+        </sheetData></worksheet>"#;
+        let (rows, total) = parse_xlsx_worksheet(sheet_xml, &shared, 50, 10);
+        assert_eq!(total, 2);
+        assert_eq!(rows[0], vec!["Producto", "", "Total"]);
+        assert_eq!(rows[1], vec!["Laptop", "", "1500"]);
     }
 }

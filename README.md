@@ -1,71 +1,86 @@
-# 🐉 Radar del Dragón
+# 🐉 Radar del Dragón (Dragon Radar Tool)
 
-**Radar del Dragón** es una herramienta pensada para ayudarte a encontrar cualquier archivo o documento dentro de tu computadora en cuestión de segundos, con una pantalla interactiva inspirada en un radar clásico.
+**Radar del Dragón** es una herramienta ultra-rápida escrita en Rust para indexar, buscar y previsualizar cualquier archivo o documento dentro de tu computadora en milisegundos, con una interfaz táctica inspirada en un radar clásico.
 
 ---
 
-## ✨ ¿Qué puede hacer por ti?
+## ✨ Funcionalidades Principales
 
-### 1. Encuentra archivos por su nombre o por lo que dicen por dentro
-- **Documentos** *(PDF, Word, Excel, PowerPoint, libros digitales, notas y archivos de texto)*: los encuentra tanto si escribes el **nombre del archivo** como si escribes **palabras o frases que aparecen dentro del texto**. Además, te muestra una vista previa con el fragmento exacto donde apareció lo que buscabas.
-- **Multimedia** *(videos, películas, audios, canciones y subtítulos)*: los ubica rápidamente por el **nombre del archivo**.
-- **Imágenes y Diseño** *(fotografías, ilustraciones, vectores, diseños gráficos y planos)*: los ubica por el **nombre del archivo**.
-- **Otros archivos del equipo**: también puedes localizarlos por su **nombre**.
+### 1. Búsqueda híbrida, por contenido y por extensión
+- **HÍBRIDO**: combina coincidencia por nombre, **índice directo por extensión**, búsqueda de texto completo **BM25** (Tantivy) y similitud **semántica vectorial**.
+- **DOCS**: busca únicamente dentro de documentos (PDF, Word, Excel, PowerPoint, texto y código).
+- **MULTIMEDIA**: localiza videos, audios y subtítulos por nombre o extensión.
+- **DISEÑO/IMG**: localiza fotografías, vectores, CAD/3D y archivos de diseño gráfico.
+- **CONTENIDO**: busca exclusivamente dentro del texto extraído de documentos y muestra el párrafo exacto de coincidencia.
+- **NOMBRE/SYS**: busca por nombre o extensión en todo tipo de archivos del equipo.
+- **EXTENSIÓN**: busca directamente usando el índice B-Tree invertido de extensiones (`extension_index`), con soporte para:
+  - Extensiones simples o con comodín: `pdf`, `.pdf`, `*.xlsx`, `ext:docx`, `tipo:pptx`.
+  - Listas múltiples: `.pdf, .docx` o `xlsx csv`.
+  - Combinación extensión + palabra clave: `pdf contrato` o `ext:xlsx presupuesto 2026`.
+  - Chips rápidos interactivos con las extensiones más frecuentes indexadas en tu equipo.
+  - En el **cuadro de búsqueda general (`HÍBRIDO` y demás modos)** también puedes filtrar directamente con `.pdf`, `*.xlsx` o `ext:docx`, o escribir una extensión como `xlsx` o `dwg`.
 
-### 2. Búsqueda flexible y sin complicaciones
-- No importa si escribes **con o sin tildes** (por ejemplo, buscar `informacion` también encuentra `información`).
-- No hace falta escribir la palabra completa: si escribes el comienzo de una palabra (como `contrat`), también encontrará variaciones como `contrato` o `contratos`.
-- Ordena primero tus carpetas y documentos personales para que los resultados importantes aparezcan arriba.
+### 2. Vista previa integrada con 1 clic y apertura con 2 clics
+- **1 clic en cualquier resultado** *(o con `↑` / `↓`)*: abre la **Vista Previa integrada** en el panel derecho (sin depender de herramientas externas ni botones de QuickLook nativo).
+- **2 clics en un resultado** *(o `Enter`)*: abre directamente la carpeta contenedora en el **Explorador de Windows** seleccionando el archivo.
+- **Formatos soportados en vista previa**:
+  - **Word (`.docx`, `.docm`, `.dotx`, `.doc`, `.odt`, `.rtf`)**: renderizado visual en hojas tipo **A4** con estilos, títulos, negritas, colores, listas, imágenes embebidas y tablas, además de conmutación automática a vista **PDF por páginas** cuando LibreOffice está disponible.
+  - **Excel (`.xlsx`, `.xlsm`, `.ods`, `.csv`, `.tsv`)**: selector interactivo de pestañas por **hoja de cálculo**, columnas `A, B, C...`, filas numeradas, encabezados congelados y celdas combinadas (`colspan`/`rowspan`).
+  - **PowerPoint (`.pptx`, `.pptm`, `.ppsx`, `.odp`, `.ppt`)**: visor panorámico **16:9 por diapositivas** con fondos, formas, textos posicionados, imágenes embebidas y notas del orador.
+  - **PDF, texto/código, Markdown, imágenes, audio/video y comprimidos `.zip`**: visores dedicados con reproducción por streaming HTTP (`Range`).
+- **Validación automática de LibreOffice en la primera ejecución**: al arrancar por primera vez, Radar del Dragón verifica si **LibreOffice** (`soffice.com` / `soffice.exe`) está instalado y guarda el estado en `radar.redb`. Si no está instalado, muestra un aviso descartable en la parte superior y continúa funcionando normalmente con el visor OOXML integrado.
 
 ### 3. Actualización automática e inteligente
-- **Primera vez**: al abrir el programa por primera vez, revisa automáticamente tus discos y carpetas personales (Documentos, Descargas, Escritorio, imágenes, videos, etc.) omitiendo carpetas internas del sistema para no llenarte de basura.
-- **Puntos de guardado**: si apagas el equipo o cierras el programa antes de que termine la primera revisión, la próxima vez continúa exactamente desde donde se quedó, sin empezar de cero.
-- **Siempre al día**: cada vez que lo vuelves a abrir, verifica automáticamente si creaste archivos nuevos, editaste alguno, los moviste de carpeta o los borraste, y actualiza la lista al instante.
-
-### 4. Privacidad y funcionamiento en red local
-- **Cada equipo busca en sus propios archivos**: si la herramienta se comparte en una red local de oficina o entre varias computadoras, cada equipo crea y guarda su propio registro privado dentro de esa misma computadora.
-- Al buscar desde tu equipo, **siempre** se revisarán únicamente tus archivos locales, nunca los del servidor ni los de otras personas.
+- **Primera ejecución**: escanea automáticamente unidades locales y carpetas personales omitiendo rutas basura o del sistema operativo.
+- **Checkpoints persistentes**: si se interrumpe el primer escaneo, continúa desde el último punto de control.
+- **Validación en cada arranque**: detecta archivos nuevos, modificados por peso/fecha, movidos de carpeta y eliminados.
 
 ---
 
-## 🧭 Cómo usar la pantalla del Radar
+## 🧭 Controles y Atajos de Teclado
 
-1. **Abrir el programa**
-   - Haz doble clic en **`iniciar_radar.bat`** (o en **`dragon.exe`**).
-   - Se abrirá automáticamente una ventana en tu navegador con la pantalla del Radar. *(Mantén abierta la ventana negra de inicio mientras lo estés usando).*
-
-2. **Escribir lo que buscas**
-   - En la barra superior derecha escribe el nombre del archivo o alguna palabra que recuerdes del contenido del documento.
-   - Los resultados aparecerán de inmediato en la lista y como **esferas luminosas** dentro del radar verde.
-
-3. **Usar los filtros de búsqueda**
-   - **HÍBRIDO**: busca en todo tipo de archivos a la vez (nombres y contenido).
-   - **DOCS**: se enfoca únicamente en documentos (por nombre y por texto interno).
-   - **MULTIMEDIA**: muestra solo videos y audios.
-   - **DISEÑO/IMG**: muestra solo imágenes, vectores y archivos de diseño.
-   - **CONTENIDO**: busca exclusivamente **dentro del texto** de tus documentos y muestra el párrafo donde coincide.
-   - **NOMBRE/SYS**: busca por el nombre en cualquier archivo del equipo.
-
-4. **Interactuar con los resultados**
-   - **Clic en una fila**: abre la **Vista Rápida** para leer el contenido del documento al instante sin tener que abrir otros programas.
-   - **Clic en una esfera del radar**: selecciona ese archivo en la lista.
-   - **Clic en el botón superior del radar**: cambia el nivel de acercamiento (zoom) de la cuadrícula del radar.
-
-5. **Atajos de teclado**
-   - **`↑` / `↓`**: sube y baja entre los archivos encontrados.
-   - **`Espacio`**: abre la Vista Rápida del archivo seleccionado.
-   - **`Enter`**: abre directamente la carpeta donde está guardado el archivo.
-   - **`Esc`**: cierra la Vista Rápida.
+- **1 clic en fila / esfera del radar**: selecciona el archivo y carga su Vista Previa integrada.
+- **2 clics en fila**: abre la ubicación del archivo en el Explorador de Windows.
+- **Botón superior del radar**: cambia la escala de zoom (`1X`, `2X`, `3X`) y dispara una onda de pulso.
+- **`↑` / `↓`**: navega entre los resultados y actualiza la vista previa.
+- **`Espacio`**: amplía la vista previa en el modal expandido *(cuando el cursor no está escribiendo en el buscador)*.
+- **`Enter`**: abre la carpeta del archivo seleccionado en el Explorador.
+- **`Esc`**: cierra la vista previa ampliada.
 
 ---
 
-## 🌐 Uso en red local (varios equipos en oficina)
+## 🛠️ Compilación y Edición PORTABLE
 
-- **Desde una carpeta compartida en red:** si el programa está guardado en una carpeta compartida de la oficina, cualquier usuario puede abrir **`iniciar_radar.bat`** desde su computadora. Automáticamente se creará un índice privado en esa PC para buscar solo en sus propios discos.
-- **Desde el navegador en red local:** si el administrador abre la pantalla del radar para la red de la oficina y entras desde otro equipo, verás un botón llamado **"ACTIVAR EN ESTE EQUIPO"** la primera vez. Al descargarlo y abrirlo una sola vez, tu computadora preparará su propio buscador local y todas tus búsquedas leerán únicamente tus archivos.
+### Script compilador en PowerShell (`compilador.ps1`)
+Para compilar los cambios del proyecto y actualizar ambos ejecutables automáticamente:
+
+```powershell
+.\compilador.ps1
+```
+
+Este script:
+1. Valida sintaxis JS (`node --check ui\radar.js`) y ejecuta las pruebas (`cargo test --workspace` y perfil portable sin LAN).
+2. Compila la edición estándar en release y actualiza **`.\dragon.exe`**.
+3. Compila la edición autónoma sin LAN (`--no-default-features` + `-C target-feature=+crt-static`) en **`.\PORTABLE\dragon.exe`**.
+4. Verifica que ningún archivo trackeable supere los límites de GitHub (**50 MB** alerta / **100 MB** máximo) para hacer commit y push sin problemas desde **GitHub Desktop**.
+
+Opciones útiles:
+- `.\compilador.ps1 -KillRunning`: cierra procesos activos de `dragon.exe` antes de compilar.
+- `.\compilador.ps1 -SoloEstandar` / `-SoloPortable`: compila solo una de las dos ediciones.
+- `.\compilador.ps1 -SkipTests`: omite las pruebas previas para compilar más rápido.
+
+### Carpeta `PORTABLE\` (Sin Red LAN)
+La carpeta [`PORTABLE`](file:///C:/Users/Drhapso/Documents/PROYECTOS%20IA%20INDEPENDIENTES/RADAR%20DEL%20DRAGON/RADAR%20DRAGON%20TOOL/PORTABLE) contiene una versión lista para copiar y ejecutar en cualquier equipo Windows:
+- **`PORTABLE\dragon.exe`**: compilado **sin la funcionalidad de red LAN** (escucha exclusivamente en `127.0.0.1`, desactiva `--lan` y las rutas `/api/agent/*`) y con CRT estático para funcionar sin dependencias externas.
+- **`PORTABLE\iniciar_portable.bat`**: acceso directo para iniciar el radar portátil.
+- **`PORTABLE\README_PORTABLE.md`**: instrucciones de uso de la edición portátil.
 
 ---
 
-## 🔄 Si quieres preparar el equipo antes de abrir el radar
+## 🌐 Uso estándar y en Red LAN
 
-- Puedes hacer doble clic en **`indexar_equipo.bat`** para que revise todas las carpetas personales de tu computadora y deje todo listo antes de comenzar a buscar.
+- **Uso normal en este PC**: ejecuta **`iniciar_radar.bat`** o **`dragon.exe`**.
+- **Modo servidor LAN** *(solo edición estándar)*: ejecuta `dragon.exe ui --lan` para exponer el HUD en la red local (`0.0.0.0`). Cada computadora cliente descarga o activa su motor local aislado para buscar exclusivamente en sus propios discos.
+- **Indexación manual anticipada**: ejecuta **`indexar_equipo.bat`** o **`indexar_equipo.ps1`**.
+
+Para detalles técnicos de arquitectura, endpoints REST, esquema de tablas `redb` y compilación, consulta [`DOCUMENTACION.md`](file:///C:/Users/Drhapso/Documents/PROYECTOS%20IA%20INDEPENDIENTES/RADAR%20DEL%20DRAGON/RADAR%20DRAGON%20TOOL/DOCUMENTACION.md).

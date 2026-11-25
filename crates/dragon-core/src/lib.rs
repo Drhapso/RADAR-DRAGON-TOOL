@@ -67,10 +67,21 @@ pub enum SearchMode {
     Filename,
     /// Búsqueda de contenido indexado (Tantivy).
     Content,
+    /// Búsqueda directa por extensión de archivo indexada en Redb.
+    Extension,
     /// Búsqueda semántica por significado (Vectores).
     Semantic,
     /// Fusión híbrida de resultados ponderados.
     Hybrid,
+}
+
+/// Extrae la extensión de un nombre o ruta en minúsculas y sin punto inicial.
+pub fn extract_extension_lower<P: AsRef<Path>>(path: P) -> Option<String> {
+    path.as_ref()
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.trim_start_matches('.').to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
 }
 
 /// Categoría funcional de cada archivo para controlar qué se indexa por contenido vs solo por nombre.
@@ -88,12 +99,7 @@ pub enum FileCategory {
 
 /// Clasifica un archivo según su extensión para aplicar reglas de indexación y prioridad.
 pub fn classify_path<P: AsRef<Path>>(path: P) -> FileCategory {
-    let ext = path
-        .as_ref()
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
-        .unwrap_or_default();
+    let ext = extract_extension_lower(path).unwrap_or_default();
     classify_extension(&ext)
 }
 

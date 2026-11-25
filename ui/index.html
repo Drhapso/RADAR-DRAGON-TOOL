@@ -86,7 +86,7 @@
             <section class="search-feed-panel">
                 <div class="search-box-wrapper">
                     <span class="prompt-symbol">▶</span>
-                    <input type="text" id="searchInput" class="tactical-input" placeholder="BUSCAR ARCHIVOS, DOCUMENTOS, MULTIMEDIA O DISEÑO..." autofocus autocomplete="off" spellcheck="false">
+                    <input type="text" id="searchInput" class="tactical-input" placeholder="BUSCAR ARCHIVOS, TEXTO O EXTENSIÓN (EJ: .PDF, *.XLSX, EXT:DOCX)..." autofocus autocomplete="off" spellcheck="false">
                     <div class="search-mode-toggles">
                         <button class="mode-btn active" data-mode="all">HÍBRIDO</button>
                         <button class="mode-btn" data-mode="documents">DOCS</button>
@@ -94,7 +94,13 @@
                         <button class="mode-btn" data-mode="design">DISEÑO/IMG</button>
                         <button class="mode-btn" data-mode="content">CONTENIDO</button>
                         <button class="mode-btn" data-mode="filename">NOMBRE/SYS</button>
+                        <button class="mode-btn" data-mode="extension">EXTENSIÓN</button>
                     </div>
+                </div>
+
+                <div id="extensionChipsBar" class="extension-chips-bar" hidden>
+                    <span class="extension-chips-label">EXTENSIONES:</span>
+                    <div id="extensionChipsList" class="extension-chips-list"></div>
                 </div>
 
                 <div id="lanAgentBanner" class="lan-agent-banner" hidden>
@@ -104,32 +110,75 @@
                     <a id="lanAgentDownloadBtn" class="lan-banner-btn" href="/api/agent/launcher">ACTIVAR EN ESTE EQUIPO</a>
                 </div>
 
-                <div class="results-container" id="resultsContainer">
-                    <div class="empty-state">
-                        <p class="empty-title">RADAR LISTO PARA RASTREAR</p>
-                        <p class="empty-subtitle">Escribe el nombre de un archivo o el texto dentro de tus documentos</p>
+                <div id="libreofficeNoticeBanner" class="libreoffice-notice-banner" hidden>
+                    <div class="lan-banner-text">
+                        <strong>Aviso de primera ejecución:</strong> No se detectó <b>LibreOffice</b> instalado en este equipo. La vista previa integrada funciona con el visor OOXML, pero instalar LibreOffice habilita el renderizado exacto por páginas en Word, Excel y PowerPoint.
                     </div>
+                    <button type="button" id="libreofficeNoticeCloseBtn" class="libreoffice-notice-close" title="Ocultar aviso">&times;</button>
+                </div>
+
+                <div class="results-workspace">
+                    <div class="results-container" id="resultsContainer">
+                        <div class="empty-state">
+                            <p class="empty-title">RADAR LISTO PARA RASTREAR</p>
+                            <p class="empty-subtitle">Escribe el nombre de un archivo o el texto dentro de tus documentos</p>
+                        </div>
+                    </div>
+
+                    <aside class="preview-pane" id="previewPane" aria-label="Vista previa de documento">
+                        <div class="preview-pane-header">
+                            <div class="preview-pane-title-group">
+                                <span class="preview-pane-badge" id="previewBadge">PREVIEW</span>
+                                <div class="preview-pane-titles">
+                                    <div class="preview-pane-title" id="previewTitle">VISTA PREVIA</div>
+                                    <div class="preview-pane-meta" id="previewMeta">1 click para previsualizar · 2 clicks para abrir ubicación</div>
+                                </div>
+                            </div>
+                            <div class="preview-pane-actions">
+                                <button type="button" class="preview-action-btn" id="previewOpenLocationBtn" title="Abrir ubicación en Explorador (Doble clic / Enter)" disabled>📂 Ubicación</button>
+                                <button type="button" class="preview-action-btn" id="previewCopyBtn" title="Copiar texto extraído" hidden disabled>📋 Copiar</button>
+                                <button type="button" class="preview-action-btn" id="previewExpandBtn" title="Ampliar vista previa (Espacio)" disabled>⛶ Ampliar</button>
+                            </div>
+                        </div>
+                        <div class="preview-pane-body" id="previewPaneBody">
+                            <div class="preview-empty-state">
+                                <div class="preview-empty-icon">📄</div>
+                                <p class="empty-title">SELECCIONA UN ARCHIVO</p>
+                                <p class="empty-subtitle"><b>1 Click</b> sobre cualquier resultado para ver su vista previa.<br><b>2 Clicks</b> para abrir su carpeta en el equipo.</p>
+                            </div>
+                        </div>
+                    </aside>
                 </div>
 
                 <footer class="hud-footer">
+                    <div class="shortcut-tip"><kbd>1 CLICK</kbd> VISTA PREVIA</div>
+                    <div class="shortcut-tip"><kbd>2 CLICKS</kbd> ABRIR UBICACIÓN</div>
                     <div class="shortcut-tip"><kbd>↑</kbd><kbd>↓</kbd> NAVEGAR</div>
+                    <div class="shortcut-tip"><kbd>SPACE</kbd> AMPLIAR</div>
                     <div class="shortcut-tip"><kbd>ENTER</kbd> ABRIR UBICACIÓN</div>
-                    <div class="shortcut-tip"><kbd>SPACE</kbd> VISTA RÁPIDA</div>
-                    <div class="shortcut-tip"><kbd>CLICK BLIP</kbd> ENFOCAR</div>
+                    <div class="shortcut-tip"><kbd>CLICK BLIP</kbd> ENFOCAR Y PREVIEW</div>
                 </footer>
             </section>
         </main>
     </div>
 
-    <!-- Modal de Vista Rápida Estilo Ficha Capsule Corp -->
+    <!-- Modal de Vista Rápida Ampliada Estilo Ficha Capsule Corp -->
     <div class="quick-look-modal" id="quickLookModal">
         <div class="modal-content">
             <div class="modal-header">
-                <span class="modal-title" id="modalTitle">VISTA RÁPIDA DE ARCHIVO</span>
-                <button class="modal-close-btn" id="modalCloseBtn">&times;</button>
+                <div class="modal-title-wrap">
+                    <span class="modal-title" id="modalTitle">VISTA RÁPIDA DE ARCHIVO</span>
+                    <span class="modal-subtitle" id="modalSubtitle"></span>
+                </div>
+                <div class="modal-header-actions">
+                    <button type="button" class="preview-action-btn" id="modalOpenLocationBtn" title="Abrir ubicación en Explorador">📂 Ubicación</button>
+                    <button type="button" class="modal-close-btn" id="modalCloseBtn">&times;</button>
+                </div>
             </div>
-            <div class="modal-body">
-                <pre class="code-preview" id="modalCodePreview">// Cargando contenido...</pre>
+            <div class="modal-body" id="modalBody">
+                <div id="modalPreviewContainer" class="modal-preview-container">
+                    <pre class="code-preview" id="modalCodePreview">// Cargando contenido...</pre>
+                </div>
             </div>
         </div>
     </div>

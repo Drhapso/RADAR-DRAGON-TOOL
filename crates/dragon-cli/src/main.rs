@@ -151,11 +151,12 @@ enum Commands {
         #[arg(short, long, default_value_t = 8088)]
         port: u16,
 
-        /// Dirección IP de escucha (127.0.0.1 local, 0.0.0.0 para red LAN cerrada)
+        /// Dirección IP de escucha (127.0.0.1 local; en compilación estándar 0.0.0.0 para red LAN)
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
 
         /// Habilita acceso de interfaz web en la red LAN cerrada (--host 0.0.0.0)
+        #[cfg(feature = "lan")]
         #[arg(long, default_value_t = false)]
         lan: bool,
 
@@ -175,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
     let command = cli.command.unwrap_or(Commands::Ui {
         port: 8088,
         host: "127.0.0.1".to_string(),
+        #[cfg(feature = "lan")]
         lan: false,
         local: false,
     });
@@ -449,9 +451,14 @@ async fn main() -> anyhow::Result<()> {
         Commands::Mcp => {
             dragon_mcp::run_stdio_server().await?;
         }
+        #[cfg(feature = "lan")]
         Commands::Ui { port, host, lan, local } => {
             let bind_host = if lan { "0.0.0.0".to_string() } else { host };
             ui_server::run_ui_server(&bind_host, port, local).await?;
+        }
+        #[cfg(not(feature = "lan"))]
+        Commands::Ui { port, host: _, local } => {
+            ui_server::run_ui_server("127.0.0.1", port, local).await?;
         }
         Commands::Info => {
             let paths = indexer::resolve_machine_storage_paths(false);

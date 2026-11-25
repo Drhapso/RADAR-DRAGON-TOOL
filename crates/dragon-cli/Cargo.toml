@@ -8,6 +8,10 @@ license.workspace = true
 name = "dragon"
 path = "src/main.rs"
 
+[features]
+default = ["lan"]
+lan = []
+
 [dependencies]
 dragon-core.workspace = true
 dragon-mft.workspace = true
@@ -20,6 +24,7 @@ tokio.workspace = true
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 env_logger.workspace = true
