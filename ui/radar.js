@@ -12,6 +12,20 @@ const modalCodePreview = document.getElementById('modalCodePreview');
 const modalCloseBtn = document.getElementById('modalCloseBtn');
 const radarTopBtn = document.getElementById('radarTopBtn');
 const sweepStatusEl = document.getElementById('sweepStatus');
+const lanAgentBanner = document.getElementById('lanAgentBanner');
+const lanAgentDownloadBtn = document.getElementById('lanAgentDownloadBtn');
+
+// Resolución de motor local:
+// Si la interfaz web se abre desde otro servidor de la red LAN, consulta el motor local del propio equipo (127.0.0.1)
+// para buscar e indexar exclusivamente los archivos locales de este equipo y nunca los del servidor.
+const isLocalOrigin = ['127.0.0.1', 'localhost', '::1', ''].includes(window.location.hostname);
+const LOCAL_AGENT_BASE = `http://127.0.0.1:${window.location.port || '8088'}`;
+let apiBase = isLocalOrigin ? '' : LOCAL_AGENT_BASE;
+let localAgentOnline = isLocalOrigin;
+
+if (lanAgentDownloadBtn && !isLocalOrigin) {
+    lanAgentDownloadBtn.href = `${window.location.origin}/api/agent/launcher`;
+}
 
 // Estado del Radar Anime
 let pulsePhase = 0;
@@ -23,30 +37,44 @@ let selectedIndex = -1;
 let currentResults = [];
 let currentMode = 'all';
 
-// Cargar estado real de Dragon Radar desde el servidor
+// Cargar estado real de Dragon Radar desde el motor del equipo local
 async function updateHudStatus() {
     try {
-        const res = await fetch('/api/status');
+        const res = await fetch(`${apiBase}/api/status`);
         if (res.ok) {
             const data = await res.json();
+            localAgentOnline = true;
+            if (lanAgentBanner) lanAgentBanner.hidden = true;
+
             const dbStats = document.getElementById('dbStats');
             const statusInd = document.getElementById('statusIndicator');
+            const machineLabel = data.machine_name ? `${data.machine_name} | ` : '';
             if (dbStats) {
-                dbStats.textContent = `REDB: ${data.redb_records.toLocaleString()} | AI: ${data.vector_count} VECTORS`;
+                dbStats.textContent = `${machineLabel}ARCHIVOS: ${data.redb_records.toLocaleString()} | CONTENIDO: ${data.vector_count}`;
             }
             if (statusInd) {
                 if (data.phase === 'INITIAL_INDEXING') {
                     statusInd.innerHTML = `<span class="blink-dot"></span> INDEXANDO [${data.target_index}/${data.total_targets}] (+${data.new_files})`;
                 } else if (data.phase === 'RESUMING_CHECKPOINT') {
-                    statusInd.innerHTML = `<span class="blink-dot"></span> REANUDANDO CHECKPOINT [${data.target_index}/${data.total_targets}]`;
+                    statusInd.innerHTML = `<span class="blink-dot"></span> REANUDANDO PUNTO DE CONTROL [${data.target_index}/${data.total_targets}]`;
                 } else if (data.phase === 'VALIDATING_INDEX') {
-                    statusInd.innerHTML = `<span class="blink-dot"></span> VALIDANDO ÍNDICE [${data.target_index}/${data.total_targets}]`;
+                    statusInd.innerHTML = `<span class="blink-dot"></span> VALIDANDO EQUIPO [${data.target_index}/${data.total_targets}]`;
                 } else {
-                    statusInd.innerHTML = `<span class="blink-dot"></span> RADAR ACTIVO`;
+                    statusInd.innerHTML = `<span class="blink-dot"></span> RADAR LOCAL ACTIVO`;
                 }
             }
+            return;
         }
     } catch (_) {}
+
+    if (!isLocalOrigin) {
+        localAgentOnline = false;
+        if (lanAgentBanner) lanAgentBanner.hidden = false;
+        const statusInd = document.getElementById('statusIndicator');
+        if (statusInd) {
+            statusInd.innerHTML = `<span class="blink-dot"></span> ESPERANDO MOTOR LOCAL`;
+        }
+    }
 }
 updateHudStatus();
 setInterval(updateHudStatus, 2000);
@@ -116,9 +144,23 @@ async function performSearch(query) {
     let results = [];
     let usedApi = false;
 
+    if (!isLocalOrigin && !localAgentOnline) {
+        currentResults = [];
+        radarBlips = [];
+        blipCountEl.textContent = '0';
+        selectedIndex = -1;
+        resultsContainer.innerHTML = `
+            <div class="empty-state">
+                <p class="empty-title">ACTIVA EL RADAR EN ESTE EQUIPO</p>
+                <p class="empty-subtitle">Haz clic en "ACTIVAR EN ESTE EQUIPO" arriba para escanear y buscar los archivos locales de esta computadora.</p>
+            </div>
+        `;
+        return;
+    }
+
     if (q) {
         try {
-            const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&mode=${currentMode}&limit=25`);
+            const res = await fetch(`${apiBase}/api/search?q=${encodeURIComponent(q)}&mode=${currentMode}&limit=25`);
             if (res.ok) {
                 const apiResults = await res.json();
                 if (Array.isArray(apiResults)) {
@@ -129,7 +171,7 @@ async function performSearch(query) {
         } catch (_) {}
     }
 
-    if (!usedApi && (!q || results.length === 0)) {
+    if (!usedApi && isLocalOrigin && window.location.protocol === 'file:' && (!q || results.length === 0)) {
         const lower = q.toLowerCase();
         if (!lower) {
             results = mockDataset;
@@ -160,6 +202,15 @@ function getBadgeClass(badge) {
     return 'badge-gray';
 }
 
+function escapeHtml(str) {
+    return String(str || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 function renderResults(results) {
     if (results.length === 0) {
         resultsContainer.innerHTML = `
@@ -173,14 +224,15 @@ function renderResults(results) {
 
     resultsContainer.innerHTML = results.map((item, idx) => `
         <div class="result-row ${idx === selectedIndex ? 'selected' : ''}" data-index="${idx}">
-            <div class="result-badge ${getBadgeClass(item.badge)}">${item.badge}</div>
+            <div class="result-badge ${getBadgeClass(item.badge)}">${escapeHtml(item.badge)}</div>
             <div class="result-details">
-                <div class="result-filename">${item.name}</div>
-                <div class="result-path">${item.path}</div>
+                <div class="result-filename">${escapeHtml(item.name)}</div>
+                <div class="result-path">${escapeHtml(item.path)}</div>
+                ${item.snippet ? `<div class="result-snippet">${escapeHtml(item.snippet)}</div>` : ''}
             </div>
             <div class="result-meta">
-                <div>${item.size}</div>
-                <div class="result-score-sub">N.${idx + 1} · ${item.score}</div>
+                <div>${escapeHtml(item.size)}</div>
+                <div class="result-score-sub">N.${idx + 1} · ${escapeHtml(item.score)}</div>
             </div>
         </div>
     `).join('');
@@ -216,7 +268,7 @@ async function openQuickLook(item) {
     quickLookModal.classList.add('open');
 
     try {
-        const res = await fetch(`/api/extract?file=${encodeURIComponent(item.path)}`);
+        const res = await fetch(`${apiBase}/api/extract?file=${encodeURIComponent(item.path)}`);
         if (res.ok) {
             const data = await res.json();
             if (data.success && data.content) {
@@ -423,7 +475,7 @@ window.addEventListener('keydown', (e) => {
     } else if (e.key === 'Enter') {
         if (selectedIndex >= 0 && selectedIndex < radarBlips.length) {
             const item = radarBlips[selectedIndex].item;
-            fetch(`/api/open?file=${encodeURIComponent(item.path)}`).catch(() => {});
+            fetch(`${apiBase}/api/open?file=${encodeURIComponent(item.path)}`).catch(() => {});
         }
     } else if (e.key === 'Escape') {
         quickLookModal.classList.remove('open');

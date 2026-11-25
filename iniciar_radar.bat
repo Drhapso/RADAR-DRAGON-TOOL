@@ -1,35 +1,28 @@
 @echo off
 chcp 65001 >nul
-cd /d "%~dp0"
-title Dragon Radar Tool - Tactical Search HUD
+pushd "%~dp0"
+title Radar del Dragon - Buscador Local del Equipo
 color 0A
 cls
 echo ======================================================================
-echo                DRAGON RADAR TOOL - TACTICAL HUD
-echo   Buscador Hibrido de Alta Velocidad con MFT y Semantica IA
+echo                RADAR DEL DRAGON - BUSCADOR DE ARCHIVOS
 echo ======================================================================
 echo.
-echo Iniciando servidor tactico del Radar del Dragon...
-echo Abriendo pantalla del radar en tu navegador predeterminado...
-echo.
-echo  * HUD Web       : http://127.0.0.1:8088
-echo  * Named Pipe IPC: \\.\pipe\dragon_radar_mft
+echo Iniciando el radar en este equipo (%COMPUTERNAME%)...
+echo Los archivos se indexan y buscan localmente en esta computadora.
 echo.
 echo [NOTA]: Manten esta ventana abierta mientras utilices el radar.
-echo        Para cerrar el radar, simplemente cierra esta ventana.
+echo         Para cerrarlo, simplemente cierra esta ventana.
 echo ======================================================================
 echo.
 
 if exist "target\release\dragon.exe" (
     copy /Y "target\release\dragon.exe" "dragon.exe" >nul 2>&1
-    if exist "dragon.exe" (
-        target\release\dragon.exe ui
-    ) else (
-        target\release\dragon.exe ui
-    )
+    "target\release\dragon.exe" ui
 ) else if exist "dragon.exe" (
-    dragon.exe ui
+    "dragon.exe" ui
 ) else (
-    echo [ERROR] No se encontro dragon.exe. Por favor compila con 'cargo build --release'.
+    echo [ERROR] No se encontro dragon.exe en esta carpeta.
     pause
 )
+popd

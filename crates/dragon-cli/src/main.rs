@@ -41,78 +41,86 @@ enum Commands {
         /// Carpeta a indexar
         target: String,
 
-        /// Carpeta destino para almacenar los índices de Tantivy
-        #[arg(short, long, default_value = ".dragon-index")]
-        index_dir: String,
+        /// Carpeta destino para almacenar los índices de texto (opcional, por defecto se aísla por equipo)
+        #[arg(short, long)]
+        index_dir: Option<String>,
 
-        /// Archivo de base de datos redb
-        #[arg(short, long, default_value = ".dragon-data/radar.redb")]
-        db_path: String,
+        /// Archivo de base de datos local (opcional, por defecto se aísla por equipo)
+        #[arg(short, long)]
+        db_path: Option<String>,
 
-        /// Archivo para almacenar los vectores semánticos
-        #[arg(short, long, default_value = ".dragon-data/vectors.bin")]
-        vectors_file: String,
+        /// Archivo para almacenar los vectores semánticos (opcional)
+        #[arg(short, long)]
+        vectors_file: Option<String>,
 
         /// Forzar reindexación completa ignorando la base de datos incremental
         #[arg(short, long, default_value_t = false)]
         force: bool,
+
+        /// Fuerza el almacenamiento local aislado para este equipo
+        #[arg(long, default_value_t = false)]
+        local: bool,
     },
     /// Sincroniza automáticamente todas las unidades locales con checkpoints y validación de movidos/eliminados
     Sync {
-        /// Carpeta destino para almacenar los índices de Tantivy
-        #[arg(short, long, default_value = ".dragon-index")]
-        index_dir: String,
+        /// Carpeta destino para almacenar los índices de texto (opcional)
+        #[arg(short, long)]
+        index_dir: Option<String>,
 
-        /// Archivo de base de datos redb
-        #[arg(short, long, default_value = ".dragon-data/radar.redb")]
-        db_path: String,
+        /// Archivo de base de datos local (opcional)
+        #[arg(short, long)]
+        db_path: Option<String>,
 
-        /// Archivo para almacenar los vectores semánticos
-        #[arg(short, long, default_value = ".dragon-data/vectors.bin")]
-        vectors_file: String,
+        /// Archivo para almacenar los vectores semánticos (opcional)
+        #[arg(short, long)]
+        vectors_file: Option<String>,
 
         /// Forzar escaneo completo reiniciando el punto de control inicial
         #[arg(short, long, default_value_t = false)]
         force: bool,
+
+        /// Fuerza el almacenamiento local aislado para este equipo
+        #[arg(long, default_value_t = false)]
+        local: bool,
     },
-    /// Busca instantáneamente en el índice Tantivy por nombre o contenido
+    /// Busca instantáneamente en el índice local por nombre o contenido
     Search {
         /// Término de búsqueda
         query: String,
 
-        /// Carpeta del índice Tantivy
-        #[arg(short, long, default_value = ".dragon-index")]
-        index_dir: String,
+        /// Carpeta del índice (opcional)
+        #[arg(short, long)]
+        index_dir: Option<String>,
 
         /// Límite de resultados
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
     },
-    /// Búsqueda semántica conceptual por embeddings vectoriales (Model2Vec en CPU)
+    /// Búsqueda semántica conceptual sobre el índice local
     Semantic {
         /// Consulta conceptual (ej. "informes financieros", "controladores de hardware")
         query: String,
 
-        /// Archivo de vectores
-        #[arg(short, long, default_value = ".dragon-data/vectors.bin")]
-        vectors_file: String,
+        /// Archivo de vectores (opcional)
+        #[arg(short, long)]
+        vectors_file: Option<String>,
 
         /// Límite de resultados
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
     },
-    /// Búsqueda híbrida avanzada (BM25 + Semántica) con fusión RRF
+    /// Búsqueda híbrida avanzada en el equipo local
     Hybrid {
         /// Consulta para búsqueda combinada
         query: String,
 
-        /// Carpeta del índice Tantivy
-        #[arg(short, long, default_value = ".dragon-index")]
-        index_dir: String,
+        /// Carpeta del índice (opcional)
+        #[arg(short, long)]
+        index_dir: Option<String>,
 
-        /// Archivo de vectores
-        #[arg(short, long, default_value = ".dragon-data/vectors.bin")]
-        vectors_file: String,
+        /// Archivo de vectores (opcional)
+        #[arg(short, long)]
+        vectors_file: Option<String>,
 
         /// Peso relativo de coincidencia exacta BM25
         #[arg(long, default_value_t = 1.0)]
@@ -137,11 +145,23 @@ enum Commands {
     },
     /// Inicia el servidor stdio de Model Context Protocol (MCP) para conectar agentes IA
     Mcp,
-    /// Abre la interfaz táctica Dragon Radar en el navegador local conectado a los motores
+    /// Abre la interfaz visual Dragon Radar conectada al índice local de este equipo
     Ui {
         /// Puerto TCP para el servidor web local
         #[arg(short, long, default_value_t = 8088)]
         port: u16,
+
+        /// Dirección IP de escucha (127.0.0.1 local, 0.0.0.0 para red LAN cerrada)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Habilita acceso de interfaz web en la red LAN cerrada (--host 0.0.0.0)
+        #[arg(long, default_value_t = false)]
+        lan: bool,
+
+        /// Fuerza guardar el índice exclusivamente en la carpeta local de este equipo
+        #[arg(long, default_value_t = false)]
+        local: bool,
     },
     /// Información del sistema, unidades detectadas y estado de privilegios
     Info,
@@ -152,7 +172,12 @@ async fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
-    let command = cli.command.unwrap_or(Commands::Ui { port: 8088 });
+    let command = cli.command.unwrap_or(Commands::Ui {
+        port: 8088,
+        host: "127.0.0.1".to_string(),
+        lan: false,
+        local: false,
+    });
 
     match command {
         Commands::Scan { target, limit } => {
@@ -211,13 +236,19 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Index { target, index_dir, db_path, vectors_file, force } => {
+        Commands::Index { target, index_dir, db_path, vectors_file, force, local } => {
+            let paths = indexer::resolve_machine_storage_paths(local);
+            let index_dir = index_dir.unwrap_or_else(|| paths.index_dir.to_string_lossy().to_string());
+            let db_path = db_path.unwrap_or_else(|| paths.db_path.to_string_lossy().to_string());
+            let vectors_file = vectors_file.unwrap_or_else(|| paths.vectors_file.to_string_lossy().to_string());
+
             println!("╔══════════════════════════════════════════════════════════╗");
             println!("║   DRAGON RADAR TOOL - INDEXADOR INCREMENTAL (REDB+AI)    ║");
             println!("╚══════════════════════════════════════════════════════════╝");
             let abs_target = indexer::clean_abs_path(Path::new(&target));
             let scan_target_str = abs_target.to_string_lossy().to_string();
 
+            println!("Equipo local       : {} ({})", paths.machine_name, paths.mode_label);
             println!("Objetivo a indexar : {}", scan_target_str);
             println!("Directorio Tantivy : {}", index_dir);
             println!("Base de datos Redb : {}", db_path);
@@ -257,10 +288,16 @@ async fn main() -> anyhow::Result<()> {
             println!("  Tiempo total                   : {:?}", elapsed);
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         }
-        Commands::Sync { index_dir, db_path, vectors_file, force } => {
+        Commands::Sync { index_dir, db_path, vectors_file, force, local } => {
+            let paths = indexer::resolve_machine_storage_paths(local);
+            let index_dir = index_dir.unwrap_or_else(|| paths.index_dir.to_string_lossy().to_string());
+            let db_path = db_path.unwrap_or_else(|| paths.db_path.to_string_lossy().to_string());
+            let vectors_file = vectors_file.unwrap_or_else(|| paths.vectors_file.to_string_lossy().to_string());
+
             println!("╔══════════════════════════════════════════════════════════╗");
             println!("║    DRAGON RADAR TOOL - SINCRONIZACION Y CHECKPOINTS      ║");
             println!("╚══════════════════════════════════════════════════════════╝");
+            println!("Equipo local       : {} ({})", paths.machine_name, paths.mode_label);
             let t0 = Instant::now();
             let state = indexer::SharedRadarState::open(
                 Path::new(&index_dir),
@@ -300,6 +337,9 @@ async fn main() -> anyhow::Result<()> {
             println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         }
         Commands::Search { query, index_dir, limit } => {
+            let paths = indexer::resolve_machine_storage_paths(false);
+            let index_dir = index_dir.unwrap_or_else(|| paths.index_dir.to_string_lossy().to_string());
+
             println!("╔══════════════════════════════════════════════════════════╗");
             println!("║              DRAGON RADAR TOOL - RADAR SEARCH            ║");
             println!("╚══════════════════════════════════════════════════════════╝");
@@ -317,6 +357,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Semantic { query, vectors_file, limit } => {
+            let paths = indexer::resolve_machine_storage_paths(false);
+            let vectors_file = vectors_file.unwrap_or_else(|| paths.vectors_file.to_string_lossy().to_string());
+
             println!("╔══════════════════════════════════════════════════════════╗");
             println!("║            DRAGON RADAR TOOL - SEMANTIC SEARCH           ║");
             println!("╚══════════════════════════════════════════════════════════╝");
@@ -343,12 +386,16 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Hybrid { query, index_dir, vectors_file, bm25_weight, semantic_weight, limit } => {
+            let paths = indexer::resolve_machine_storage_paths(false);
+            let index_dir = index_dir.unwrap_or_else(|| paths.index_dir.to_string_lossy().to_string());
+            let vectors_file = vectors_file.unwrap_or_else(|| paths.vectors_file.to_string_lossy().to_string());
+
             println!("╔══════════════════════════════════════════════════════════╗");
             println!("║        DRAGON RADAR TOOL - HYBRID RRF SEARCH (AI)        ║");
             println!("╚══════════════════════════════════════════════════════════╝");
             let t0 = Instant::now();
             let engine = DragonIndexEngine::open_or_create(&index_dir)?;
-            let bm25_hits = engine.search(&query, limit * 2).unwrap_or_default();
+            let bm25_hits = engine.search_content(&query, limit * 2).unwrap_or_default();
 
             let embedder = DragonEmbedder::load_or_detect::<&str>(None);
             let semantic_hits = if let Ok(store) = VectorStore::load_from_file(&vectors_file) {
@@ -402,22 +449,24 @@ async fn main() -> anyhow::Result<()> {
         Commands::Mcp => {
             dragon_mcp::run_stdio_server().await?;
         }
-        Commands::Ui { port } => {
-            ui_server::run_ui_server(port).await?;
+        Commands::Ui { port, host, lan, local } => {
+            let bind_host = if lan { "0.0.0.0".to_string() } else { host };
+            ui_server::run_ui_server(&bind_host, port, local).await?;
         }
         Commands::Info => {
+            let paths = indexer::resolve_machine_storage_paths(false);
             println!("╔══════════════════════════════════════════════════════════╗");
             println!("║              DRAGON RADAR TOOL - SYSTEM INFO             ║");
             println!("╚══════════════════════════════════════════════════════════╝");
             println!("Versión del binario: 0.1.0 (Phase 4: AI & MCP Operational)");
+            println!("Equipo local       : {} ({})", paths.machine_name, paths.mode_label);
             println!("Arquitectura       : {}", std::env::consts::ARCH);
             println!("Sistema Operativo  : {}", std::env::consts::OS);
 
-            let default_db = ".dragon-data/radar.redb";
-            if std::path::Path::new(default_db).exists() {
-                if let Ok(storage) = DragonStorage::open(default_db) {
+            if paths.db_path.exists() {
+                if let Ok(storage) = DragonStorage::open(&paths.db_path) {
                     if let Ok(count) = storage.count_records() {
-                        println!("Base de datos Redb : {} ({} registros almacenados)", default_db, count);
+                        println!("Base de datos Redb : {} ({} registros almacenados)", paths.db_path.display(), count);
                     }
                     if let Ok(tracked) = storage.count_index_states() {
                         println!("Huellas incrementales: {} rutas rastreadas (tamaño/fecha)", tracked);
@@ -444,10 +493,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("Base de datos Redb : No inicializada (ejecute 'dragon sync' o 'dragon ui')");
             }
 
-            let vectors_file = ".dragon-data/vectors.bin";
-            if std::path::Path::new(vectors_file).exists() {
-                if let Ok(store) = dragon_ai::VectorStore::load_from_file(vectors_file) {
-                    println!("Almacén Vectorial  : {} ({} vectores 256-d indexados)", vectors_file, store.len());
+            if paths.vectors_file.exists() {
+                if let Ok(store) = dragon_ai::VectorStore::load_from_file(&paths.vectors_file) {
+                    println!("Almacén Vectorial  : {} ({} vectores 256-d indexados)", paths.vectors_file.display(), store.len());
                 }
             }
 

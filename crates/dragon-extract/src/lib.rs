@@ -15,6 +15,7 @@ pub enum DocumentFormat {
     Docx,
     Xlsx,
     Pptx,
+    LegacyOffice,
     OpenDocument,
     Epub,
     Rtf,
@@ -36,6 +37,7 @@ pub fn detect_format<P: AsRef<Path>>(path: P) -> DocumentFormat {
         "docx" | "docm" | "dotx" | "dotm" => DocumentFormat::Docx,
         "xlsx" | "xlsm" => DocumentFormat::Xlsx,
         "pptx" | "pptm" | "ppsx" => DocumentFormat::Pptx,
+        "doc" | "xls" | "ppt" => DocumentFormat::LegacyOffice,
         "odt" | "ott" | "ods" | "odp" => DocumentFormat::OpenDocument,
         "epub" => DocumentFormat::Epub,
         "rtf" => DocumentFormat::Rtf,
@@ -59,10 +61,11 @@ pub fn extract_content<P: AsRef<Path>>(path: P, max_bytes: usize) -> Result<Stri
     let format = detect_format(p);
 
     match format {
-        DocumentFormat::Pdf => pdf::extract_pdf_text(p, 50, max_bytes),
+        DocumentFormat::Pdf => pdf::extract_pdf_text(p, 150, max_bytes),
         DocumentFormat::Docx => office::extract_docx_text(p, max_bytes),
         DocumentFormat::Xlsx => office::extract_xlsx_text(p, max_bytes),
         DocumentFormat::Pptx => office::extract_pptx_text(p, max_bytes),
+        DocumentFormat::LegacyOffice => office::extract_legacy_binary_text(p, max_bytes),
         DocumentFormat::OpenDocument => office::extract_opendocument_text(p, max_bytes),
         DocumentFormat::Epub => office::extract_epub_text(p, max_bytes),
         DocumentFormat::Rtf => office::extract_rtf_text(p, max_bytes),

@@ -142,7 +142,7 @@ pub fn classify_extension(ext: &str) -> FileCategory {
 
 /// Detecta rutas de compilación, caché o dependencias que suelen generar ruido en búsquedas.
 pub fn is_noisy_build_or_cache_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
+    let lower = path.to_ascii_lowercase().replace('/', "\\");
     lower.contains(r"\target\debug\")
         || lower.contains(r"\target\release\")
         || lower.contains(r"\.fingerprint\")
@@ -151,4 +151,26 @@ pub fn is_noisy_build_or_cache_path(path: &str) -> bool {
         || lower.contains(r"\__pycache__\")
         || lower.contains(r"\.cargo\registry\")
         || lower.contains(r"\appdata\")
+        || lower.contains(r"\.venv\")
+        || lower.contains(r"\venv\")
+        || lower.contains(r"\.next\")
+        || lower.contains(r"\.nuxt\")
+        || lower.contains(r"\dist\")
+        || lower.contains(r"\.gradle\")
+        || lower.contains(r"\.vs\")
+        || lower.contains(r"\obj\debug\")
+        || lower.contains(r"\obj\release\")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn noisy_path_detection_handles_builds_and_preserves_user_docs() {
+        assert!(!is_noisy_build_or_cache_path(r"C:\Users\Drhapso\Documents\contrato.pdf"));
+        assert!(is_noisy_build_or_cache_path(r"C:\Proj\target\debug\.fingerprint\bin-dragon.json"));
+        assert!(is_noisy_build_or_cache_path(r"C:\Web\node_modules\pkg\index.js"));
+        assert!(is_noisy_build_or_cache_path("C:/Py/.venv/lib/site.py"));
+    }
 }

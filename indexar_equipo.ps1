@@ -12,15 +12,32 @@
 [CmdletBinding()]
 param(
     [switch]$SoloDocumentos,
-    [string]$IndexDir = ".dragon-index",
-    [string]$DbPath = ".dragon-data/radar.redb",
-    [string]$VectorsFile = ".dragon-data/vectors.bin"
+    [string]$IndexDir = "",
+    [string]$DbPath = "",
+    [string]$VectorsFile = ""
 )
 
 # Asegurar codificacion UTF-8 para salida de dragon.exe y ubicarse en la raiz del proyecto
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 if ($PSScriptRoot) {
     Set-Location $PSScriptRoot
+}
+
+$isNetworkShare = $false
+if ($PSScriptRoot -and ($PSScriptRoot.StartsWith("\\") -or ((Get-Location).ProviderPath.StartsWith("\\")))) {
+    $isNetworkShare = $true
+}
+if (-not $IndexDir -or -not $DbPath -or -not $VectorsFile) {
+    if ($isNetworkShare) {
+        $localBase = Join-Path $env:LOCALAPPDATA "DragonRadar\$env:COMPUTERNAME"
+        if (-not $IndexDir)    { $IndexDir = Join-Path $localBase "index" }
+        if (-not $DbPath)      { $DbPath = Join-Path $localBase "data\radar.redb" }
+        if (-not $VectorsFile) { $VectorsFile = Join-Path $localBase "data\vectors.bin" }
+    } else {
+        if (-not $IndexDir)    { $IndexDir = ".dragon-index" }
+        if (-not $DbPath)      { $DbPath = ".dragon-data/radar.redb" }
+        if (-not $VectorsFile) { $VectorsFile = ".dragon-data/vectors.bin" }
+    }
 }
 
 $Host.UI.RawUI.WindowTitle = "Dragon Radar Tool - Indexador de Unidades Locales"

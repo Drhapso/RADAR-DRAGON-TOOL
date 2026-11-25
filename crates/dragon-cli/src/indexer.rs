@@ -9,7 +9,7 @@
 
 use anyhow::Result;
 use dragon_ai::{DragonEmbedder, VectorStore};
-use dragon_core::{classify_path, FileCategory, FileRecord};
+use dragon_core::{classify_path, is_noisy_build_or_cache_path, FileCategory, FileRecord};
 use dragon_extract::{detect_format, extract_content, DocumentFormat};
 use dragon_index::{DragonIndexEngine, IndexWriter};
 use dragon_mft::{discover_local_user_targets, UnifiedScanResult, UnifiedScanner};
@@ -22,6 +22,211 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Cada cuántos cambios (archivos nuevos/modificados/movidos) se guarda un checkpoint firme a disco.
 const CHECKPOINT_BATCH_SIZE: usize = 250;
+const OWNER_MACHINE_SETTING_KEY: &str = "owner_machine";
+
+/// Rutas resueltas para la base de datos e índices propios del equipo actual.
+#[derive(Debug, Clone)]
+pub struct MachineStoragePaths {
+    pub machine_name: String,
+    pub mode_label: String,
+    pub data_root: PathBuf,
+    pub index_dir: PathBuf,
+    pub db_path: PathBuf,
+    pub vectors_file: PathBuf,
+}
+
+/// Obtiene el nombre identificativo del equipo actual donde se ejecuta el proceso.
+pub fn get_machine_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
+        .map(|s| sanitize_machine_name(&s))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "LOCAL-PC".to_string())
+}
+
+fn sanitize_machine_name(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Devuelve la ruta de datos local dentro del perfil del equipo cliente (`%LOCALAPPDATA%\DragonRadar\<EQUIPO>`).
+pub fn per_machine_local_data_root(machine_name: &str) -> PathBuf {
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        if !local_app_data.trim().is_empty() {
+            return PathBuf::from(local_app_data)
+                .join("DragonRadar")
+                .join(machine_name);
+        }
+    }
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home)
+                .join(".dragon-radar")
+                .join(machine_name);
+        }
+    }
+    std::env::temp_dir().join("DragonRadar").join(machine_name)
+}
+
+/// Detecta si el ejecutable o directorio de trabajo proviene de una ruta de red LAN (UNC o unidad mapeada remota).
+pub fn is_running_from_network_location() -> bool {
+    if let Ok(exe) = std::env::current_exe() {
+        if is_network_path(&exe) {
+            return true;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if is_network_path(&cwd) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn is_network_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let trimmed = s.trim_start_matches(r"\\?\");
+    if s.starts_with(r"\\") || trimmed.starts_with("UNC\\") {
+        return true;
+    }
+
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+        let bytes = trimmed.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            let root = format!(r"{}:\", (bytes[0] as char).to_ascii_uppercase());
+            let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+            let dtype = unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) };
+            // DRIVE_REMOTE == 4
+            if dtype == 4 {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn is_dir_writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".dragon_write_probe_{}", std::process::id()));
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn existing_db_belongs_to_other_machine(db_path: &Path, current_machine: &str) -> bool {
+    if !db_path.exists() {
+        return false;
+    }
+    if let Ok(storage) = DragonStorage::open(db_path) {
+        if let Ok(Some(owner)) = storage.get_setting(OWNER_MACHINE_SETTING_KEY) {
+            return !owner.eq_ignore_ascii_case(current_machine);
+        }
+    }
+    false
+}
+
+/// Resuelve las rutas de indexación garantizando aislamiento por equipo cuando se ejecuta en red LAN
+/// o desde ubicaciones compartidas/solo lectura, y permitiendo operación portable local cuando se ejecuta en el mismo equipo.
+pub fn resolve_machine_storage_paths(force_per_machine_local: bool) -> MachineStoragePaths {
+    let machine_name = get_machine_name();
+
+    if let Ok(custom_dir) = std::env::var("DRAGON_DATA_DIR") {
+        let custom = custom_dir.trim();
+        if !custom.is_empty() {
+            let root = PathBuf::from(custom);
+            return MachineStoragePaths {
+                machine_name,
+                mode_label: "CUSTOM_LOCAL".to_string(),
+                index_dir: root.join("index"),
+                db_path: root.join("data").join("radar.redb"),
+                vectors_file: root.join("data").join("vectors.bin"),
+                data_root: root,
+            };
+        }
+    }
+
+    let running_over_lan = is_running_from_network_location();
+    if force_per_machine_local || running_over_lan {
+        let root = per_machine_local_data_root(&machine_name);
+        return MachineStoragePaths {
+            machine_name,
+            mode_label: if running_over_lan {
+                "LAN_CLIENT_LOCAL".to_string()
+            } else {
+                "LOCAL_PROFILE".to_string()
+            },
+            index_dir: root.join("index"),
+            db_path: root.join("data").join("radar.redb"),
+            vectors_file: root.join("data").join("vectors.bin"),
+            data_root: root,
+        };
+    }
+
+    // Buscar carpeta portable local ('.', '../..', o junto al ejecutable en disco local)
+    let mut candidate_root = PathBuf::from(".");
+    if Path::new(".dragon-data").exists() || Path::new(".dragon-index").exists() {
+        candidate_root = PathBuf::from(".");
+    } else if Path::new("../../Cargo.toml").exists() {
+        candidate_root = PathBuf::from("../..");
+    } else if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Some(repo_root) = dir.parent().and_then(|p| p.parent()) {
+                if repo_root.join("Cargo.toml").exists() {
+                    candidate_root = repo_root.to_path_buf();
+                } else {
+                    candidate_root = dir.to_path_buf();
+                }
+            } else {
+                candidate_root = dir.to_path_buf();
+            }
+        }
+    }
+
+    let candidate_db = candidate_root.join(".dragon-data").join("radar.redb");
+    if existing_db_belongs_to_other_machine(&candidate_db, &machine_name) || !is_dir_writable(&candidate_root) {
+        let root = per_machine_local_data_root(&machine_name);
+        return MachineStoragePaths {
+            machine_name,
+            mode_label: "LOCAL_ISOLATED".to_string(),
+            index_dir: root.join("index"),
+            db_path: root.join("data").join("radar.redb"),
+            vectors_file: root.join("data").join("vectors.bin"),
+            data_root: root,
+        };
+    }
+
+    MachineStoragePaths {
+        machine_name,
+        mode_label: "LOCAL_PORTABLE".to_string(),
+        index_dir: candidate_root.join(".dragon-index"),
+        db_path: candidate_db,
+        vectors_file: candidate_root.join(".dragon-data").join("vectors.bin"),
+        data_root: candidate_root,
+    }
+}
 
 /// Estado vivo compartido con el servidor HTTP del HUD para mostrar progreso en tiempo real.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -52,6 +257,15 @@ pub struct SharedRadarState {
 impl SharedRadarState {
     pub fn open(index_dir: &Path, db_path: &Path, vectors_file: &Path) -> Result<Arc<Self>> {
         let storage = Arc::new(DragonStorage::open(db_path)?);
+        let machine_name = get_machine_name();
+        if storage
+            .get_setting(OWNER_MACHINE_SETTING_KEY)
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            let _ = storage.set_setting(OWNER_MACHINE_SETTING_KEY, &machine_name);
+        }
         let index_engine = Arc::new(DragonIndexEngine::open_or_create(index_dir)?);
         let embedder = Arc::new(DragonEmbedder::load_or_detect::<&str>(None));
         let vector_store = Arc::new(RwLock::new(
@@ -833,7 +1047,7 @@ fn handle_moved_file(
 ) {
     state.index_engine.delete_by_path(writer, old_path_str);
 
-    if classify_path(clean_path) != FileCategory::Document {
+    if classify_path(clean_path) != FileCategory::Document || is_noisy_build_or_cache_path(new_path_str) {
         if let Ok(mut vs) = state.vector_store.write() {
             if vs.remove_by_path(old_path_str) {
                 *vectors_dirty = true;
@@ -850,7 +1064,7 @@ fn handle_moved_file(
 
     let format = detect_format(clean_path);
     let content = if format != DocumentFormat::Unsupported {
-        extract_content(clean_path, 50_000).unwrap_or_default()
+        extract_content(clean_path, 150_000).unwrap_or_default()
     } else {
         String::new()
     };
@@ -874,9 +1088,9 @@ fn process_extract_and_write(
     vectors_dirty: &mut bool,
 ) {
     // Regla estricta:
-    // - Documentos conocidos -> Nombre (Redb) + Contenido (Tantivy) + Vectores (Model2Vec)
-    // - Multimedia, Imágenes/Diseño, Sistema/Binarios -> Únicamente por Nombre (Redb)
-    if classify_path(clean_path) != FileCategory::Document {
+    // - Documentos conocidos (fuera de cachés/builds ruidosos) -> Nombre (Redb) + Contenido (Tantivy) + Vectores (Model2Vec)
+    // - Multimedia, Imágenes/Diseño, Sistema/Binarios y cachés -> Únicamente por Nombre (Redb)
+    if classify_path(clean_path) != FileCategory::Document || is_noisy_build_or_cache_path(path_str) {
         state.index_engine.delete_by_path(writer, path_str);
         if let Ok(mut vs) = state.vector_store.write() {
             if vs.remove_by_path(path_str) {
@@ -888,7 +1102,7 @@ fn process_extract_and_write(
 
     let format = detect_format(clean_path);
     let content = if format != DocumentFormat::Unsupported {
-        extract_content(clean_path, 50_000).unwrap_or_default()
+        extract_content(clean_path, 150_000).unwrap_or_default()
     } else {
         String::new()
     };
@@ -1050,4 +1264,31 @@ fn now_epoch_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_unc_network_paths_and_isolates_per_machine_storage() {
+        assert!(is_network_path(Path::new(r"\\SERVIDOR\Compartido\dragon.exe")));
+        assert!(is_network_path(Path::new(r"\\?\UNC\SERVIDOR\Compartido\dragon.exe")));
+        assert!(!is_network_path(Path::new(r"C:\RadarDragon\dragon.exe")));
+
+        let isolated = resolve_machine_storage_paths(true);
+        assert!(!isolated.machine_name.is_empty());
+        assert!(isolated.data_root.to_string_lossy().contains(&isolated.machine_name));
+
+        let tmp = std::env::temp_dir().join(format!("dragon_owner_test_{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let st = DragonStorage::open(&tmp).unwrap();
+        st.set_setting(OWNER_MACHINE_SETTING_KEY, "SERVIDOR-CENTRAL").unwrap();
+        drop(st);
+
+        assert!(existing_db_belongs_to_other_machine(&tmp, "PC-VENTAS-01"));
+        assert!(!existing_db_belongs_to_other_machine(&tmp, "SERVIDOR-CENTRAL"));
+
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
