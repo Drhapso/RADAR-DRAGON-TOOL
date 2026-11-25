@@ -12,24 +12,45 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 $root = Split-Path -Parent $PSScriptRoot
+$workspaceRoot = Split-Path -Parent $root
 $runLan = Join-Path $PSScriptRoot "run-lan.ps1"
 $fwScript = Join-Path $PSScriptRoot "configure-firewall.ps1"
+$serverPy = Join-Path $root "server.py"
 
-Write-Host "=== 1. Validando servidor principal $PrimaryIP y binario dragon.exe ===" -ForegroundColor Cyan
+Write-Host "=== 1. Validando servidor principal $PrimaryIP y servicio Python (sin .exe) ===" -ForegroundColor Cyan
 $ipObj = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $PrimaryIP -ErrorAction SilentlyContinue | Where-Object AddressState -eq 'Preferred'
 if (-not $ipObj) {
     throw "La IP $PrimaryIP no esta activa en este equipo. Este servicio debe instalarse unicamente en el servidor principal ($PrimaryIP), nunca en el proxy (.11)."
 }
 
-$exe = @(
-    (Join-Path $root "dragon.exe"),
-    (Join-Path $root "target\release\dragon.exe"),
-    (Join-Path $root "target\offline-lan\release\dragon.exe")
-) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-if (-not $exe) {
-    throw "No se encontro dragon.exe (compilacion estandar con LAN) en $root. Compile primero con .\compilador.ps1 o copie dragon.exe en la raiz del proyecto."
+if (-not (Test-Path -LiteralPath $serverPy -PathType Leaf)) {
+    throw "No se encontro server.py en $root."
 }
-Write-Host "Binario detectado: $exe" -ForegroundColor Green
+
+$pyCandidates = @(
+    (Join-Path $root ".venv\Scripts\python.exe"),
+    (Join-Path $workspaceRoot "FOLIO PDF\FOLIO PDF ENTERPRISE\.venv\Scripts\python.exe"),
+    (Join-Path $workspaceRoot "FALCON\falcon web\.venv\Scripts\python.exe"),
+    (Join-Path $workspaceRoot "HELP DESK TELEMATICA\.venv\Scripts\python.exe")
+)
+$sysPy = Get-Command python.exe -ErrorAction SilentlyContinue
+if ($sysPy -and $sysPy.Source) { $pyCandidates += $sysPy.Source }
+
+$pythonExe = $null
+foreach ($cand in $pyCandidates) {
+    if ($cand -and (Test-Path -LiteralPath $cand -PathType Leaf)) {
+        & $cand -c "import flask, waitress" 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $pythonExe = $cand
+            break
+        }
+    }
+}
+if (-not $pythonExe) {
+    throw "No se encontro un interprete Python con Flask y Waitress disponibles."
+}
+Write-Host "Servicio detectado : $serverPy" -ForegroundColor Green
+Write-Host "Runtime Python     : $pythonExe" -ForegroundColor Green
 
 Write-Host "=== 2. Configurando Firewall TCP $Port ($AuthorizedSubnet) ===" -ForegroundColor Cyan
 $fwName = "Dragon-Radar-LAN-$Port"
@@ -42,7 +63,7 @@ if ($existingFw) {
 }
 
 Write-Host "=== 2.5. Sincronizando scripts operativos hacia D:\script (replica-11, watchdog, reiniciar-radar) ===" -ForegroundColor Cyan
-$srcScriptDir = Join-Path (Split-Path -Parent $root) "script"
+$srcScriptDir = Join-Path $workspaceRoot "script"
 if ((Test-Path -LiteralPath "D:\script") -and (Test-Path -LiteralPath $srcScriptDir)) {
     foreach ($rel in @(
         "config\replica-11.json",
@@ -67,9 +88,9 @@ if ((Test-Path -LiteralPath "D:\script") -and (Test-Path -LiteralPath $indexValS
     Copy-Item -LiteralPath $indexValSrc -Destination "D:\script\validar-index-radar.ps1" -Force
 }
 
-Write-Host "=== 3. Registrando tarea programada SYSTEM: Dragon-Radar-LAN ===" -ForegroundColor Cyan
+Write-Host "=== 3. Registrando tarea programada SYSTEM: Dragon-Radar-LAN (Python/Waitress) ===" -ForegroundColor Cyan
 $psExe = Join-Path $PSHOME "powershell.exe"
-$taskArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$runLan`" -Port $Port"
+$taskArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runLan`" -Port $Port"
 $action = New-ScheduledTaskAction -Execute $psExe -Argument $taskArgs -WorkingDirectory $root
 $trigger = New-ScheduledTaskTrigger -AtStartup
 $trigger.Delay = "PT30S"
@@ -80,16 +101,19 @@ $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 
 Register-ScheduledTask -TaskName "Dragon-Radar-LAN" -Action $action -Trigger $trigger `
     -Principal $principalTask -Settings $settings -Force `
-    -Description "Radar del Dragon LAN en ${PrimaryIP}:${Port} (inicio sin sesion de usuario, subred ${AuthorizedSubnet})." | Out-Null
+    -Description "Radar del Dragon LAN (Servicio Python/Waitress sin .exe) en ${PrimaryIP}:${Port}, subred ${AuthorizedSubnet}." | Out-Null
 
 Write-Host "=== 4. Iniciando Dragon-Radar-LAN y validando salud ===" -ForegroundColor Cyan
+try {
+    Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:${Port}/api/shutdown" -TimeoutSec 2 -ErrorAction SilentlyContinue | Out-Null
+} catch {}
 Stop-ScheduledTask -TaskName "Dragon-Radar-LAN" -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 Start-ScheduledTask -TaskName "Dragon-Radar-LAN"
 
 $healthUrl = "http://${PrimaryIP}:${Port}/health"
 $ok = $false
-for ($i = 0; $i -lt 15; $i++) {
+for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Seconds 1
     try {
         $req = [System.Net.HttpWebRequest]::Create($healthUrl)
@@ -99,7 +123,7 @@ for ($i = 0; $i -lt 15; $i++) {
         try {
             $body = (New-Object IO.StreamReader($resp.GetResponseStream())).ReadToEnd() | ConvertFrom-Json
             if ($body.app -eq "dragon-radar" -and $body.status -eq "ok") {
-                Write-Host "[OK] Radar del Dragon operativo en $healthUrl (version: $($body.version), modo: $($body.lan_mode))" -ForegroundColor Green
+                Write-Host "[OK] Radar del Dragon operativo en $healthUrl (version: $($body.version), motor: $($body.engine), modo: $($body.lan_mode))" -ForegroundColor Green
                 $ok = $true
                 break
             }
@@ -107,5 +131,5 @@ for ($i = 0; $i -lt 15; $i++) {
     } catch {}
 }
 if (-not $ok) {
-    Write-Warning "La tarea Dragon-Radar-LAN fue registrada e iniciada, pero $healthUrl aun no respondio en 15s. Verifique que dragon.exe incluya la feature lan."
+    Write-Warning "La tarea Dragon-Radar-LAN fue registrada e iniciada, pero $healthUrl aun no respondio en 20s. Verifique los logs del servicio."
 }

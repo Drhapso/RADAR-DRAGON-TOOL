@@ -1,16 +1,8 @@
 <#
 .SYNOPSIS
-    Regla de arranque automatico del servicio de indexacion de Radar del Dragon al encender
-    el equipo y mantenimiento periodico de la base de datos (redb + Tantivy + vectores).
-
-.DESCRIPTION
-    1. Respeta la regla anti-split-brain (bloquea instalacion de indexador local en el proxy 172.23.174.11).
-    2. Registra la tarea 'Dragon-Radar-Indexador-Arranque':
-       - Como Administrador: inicia al encender Windows (AtStartup, SYSTEM, sin sesion de usuario).
-       - Como usuario estandar: inicia al iniciar sesion (AtLogon, oculto en segundo plano).
-    3. Registra la tarea 'Dragon-Radar-Mantener-DB' (cada 30 min) que ejecuta validar-index-al-abrir.ps1
-       para verificar que todas las unidades fijas (C:\, D:\, ...) esten indexadas y mantener la DB al dia.
-    4. Ejecuta una validacion inmediata de las unidades locales detectadas en el equipo.
+    Regla de arranque automatico del servicio Python de indexacion de Radar del Dragon
+    al encender el equipo y mantenimiento periodico de la base de datos SQLite FTS5.
+    No utiliza ningun ejecutable personalizado (.exe).
 
 .EXAMPLE
     .\deploy\instalar-servicio-indexacion-arranque.ps1
@@ -40,6 +32,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $runLanScript = Join-Path $PSScriptRoot "run-lan.ps1"
 $validateScript = Join-Path $PSScriptRoot "validar-index-al-abrir.ps1"
+$serverPy = Join-Path $root "server.py"
 $bootTaskName = "Dragon-Radar-Indexador-Arranque"
 $keepFreshTaskName = "Dragon-Radar-Mantener-DB"
 
@@ -57,20 +50,15 @@ if ($localIps -contains $ProxyIP) {
     throw "Este equipo ($ProxyIP) opera como servidor PROXY. Por regla anti-split-brain no se permite instalar el indexador local aqui."
 }
 
-$exe = @(
-    (Join-Path $root "dragon.exe"),
-    (Join-Path $root "target\release\dragon.exe"),
-    (Join-Path $root "target\offline-lan\release\dragon.exe")
-) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-if (-not $exe) {
-    throw "No se encontro dragon.exe en $root. Compile primero con .\compilador.ps1 -SoloEstandar."
+if (-not (Test-Path -LiteralPath $serverPy -PathType Leaf)) {
+    throw "No se encontro server.py en $root."
 }
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isAdmin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $psExe = Join-Path $PSHOME "powershell.exe"
 
-Write-Host "=== Instalacion de Servicio de Indexacion al Encender ($env:COMPUTERNAME) ===" -ForegroundColor Cyan
+Write-Host "=== Instalacion de Servicio Python de Indexacion al Encender ($env:COMPUTERNAME) ===" -ForegroundColor Cyan
 Write-Host ("Modo: {0} | Puerto: {1} | Privilegios Admin: {2}" -f $(if ($SoloLocal) { "SOLO LOCAL" } else { "SERVIDOR LAN" }), $Port, $(if ($isAdmin) { "SI (AtStartup/SYSTEM)" } else { "NO (AtLogon/Usuario)" })) -ForegroundColor Gray
 
 # 1. Tarea de arranque automatico (al encender / iniciar sesion)
@@ -96,7 +84,7 @@ $bootXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>Inicia automaticamente Radar del Dragon e indexa las unidades locales al encender el equipo ($env:COMPUTERNAME, puerto $Port).</Description>
+    <Description>Inicia automaticamente el servicio Python de Radar del Dragon e indexa las unidades locales ($env:COMPUTERNAME, puerto $Port).</Description>
   </RegistrationInfo>
   <Triggers>
     $triggerBoot
@@ -198,7 +186,7 @@ foreach ($d in $fixedDrives) {
 try {
     $st = Invoke-RestMethod -Uri "http://127.0.0.1:${Port}/api/status" -TimeoutSec 4
     Write-Host ""
-    Write-Host ("Estado live del motor (puerto $Port): fase={0} | progreso={1}/{2} | archivos={3} | vectores={4}" -f $st.phase, $st.target_index, $st.total_targets, $st.redb_records, $st.vector_count) -ForegroundColor Green
+    Write-Host ("Estado live del motor (puerto $Port): fase={0} | progreso={1}/{2} | archivos={3} | contenido={4}" -f $st.phase, $st.target_index, $st.total_targets, $st.redb_records, $st.vector_count) -ForegroundColor Green
     if ($st.drives) {
         foreach ($drv in $st.drives) {
             Write-Host ("  -> {0}  Estado: {1,-9} | Archivos: {2,-8} | Carpetas: {3}/{4}" -f $drv.drive, $drv.status, $drv.indexed_files, $drv.targets_completed, $drv.targets_total) -ForegroundColor Cyan

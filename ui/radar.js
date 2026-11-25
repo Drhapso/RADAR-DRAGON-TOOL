@@ -86,9 +86,10 @@ async function detectServerMode() {
         if (info.port) {
             serverPort = String(info.port);
         }
+        const isClientLocal = isLocalOrigin || Boolean(info.client_is_local);
         if (info.shared_server_active) {
             isSharedServerMode = true;
-            remoteSharedMode = !isLocalOrigin;
+            remoteSharedMode = !isClientLocal;
             apiBase = '';
             localAgentOnline = true;
             if (lanAgentBanner) lanAgentBanner.hidden = true;
@@ -105,7 +106,13 @@ async function detectServerMode() {
                 sharedServerBanner.hidden = false;
             }
             applyActionLabelsForMode();
-        } else if (!isLocalOrigin) {
+        } else if (isClientLocal) {
+            isSharedServerMode = false;
+            remoteSharedMode = false;
+            apiBase = '';
+            localAgentOnline = true;
+            if (lanAgentBanner) lanAgentBanner.hidden = true;
+        } else {
             isSharedServerMode = false;
             remoteSharedMode = false;
             apiBase = `http://127.0.0.1:${serverPort}`;
@@ -853,12 +860,42 @@ async function openFileLocation(item, rowEl = null) {
         link.remove();
         return;
     }
-    if (previewMeta) {
-        previewMeta.textContent = `📂 Abriendo ubicación: ${item.path}`;
-    }
+    const setStatus = (msg) => {
+        if (previewMeta) previewMeta.textContent = msg;
+        if (modalSubtitle && quickLookModal && quickLookModal.classList.contains('open')) {
+            modalSubtitle.textContent = msg;
+        }
+    };
+    setStatus(`📂 Abriendo ubicación: ${item.path}`);
     try {
-        await fetch(`${apiBase}/api/open?file=${encodeURIComponent(item.path)}`);
-    } catch (_) {}
+        const res = await fetch(`${apiBase}/api/open?file=${encodeURIComponent(item.path)}`);
+        let data = null;
+        try {
+            data = await res.json();
+        } catch (_) {}
+        if (res.ok && data && data.opened) {
+            setStatus(`📂 Ubicación abierta: ${data.target || item.path}`);
+        } else if (res.ok && data && data.session0) {
+            const pathToCopy = data.directory || data.target || item.path;
+            let copied = false;
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                    await navigator.clipboard.writeText(pathToCopy);
+                    copied = true;
+                }
+            } catch (_) {}
+            setStatus(
+                copied
+                    ? `📋 Ruta copiada (servicio en segundo plano): ${pathToCopy} — pégala en el Explorador (Win+R)`
+                    : `📁 Servicio en segundo plano: abre esta carpeta en el Explorador → ${pathToCopy}`
+            );
+        } else {
+            const errMsg = (data && data.error) || `Error HTTP ${res.status}`;
+            setStatus(`⚠️ No se pudo abrir ubicación: ${errMsg}`);
+        }
+    } catch (err) {
+        setStatus(`⚠️ Error al abrir ubicación: ${err && err.message ? err.message : 'sin conexión con el agente local'}`);
+    }
 }
 
 function updatePreviewActionButtons(item, data) {

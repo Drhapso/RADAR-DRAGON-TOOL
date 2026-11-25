@@ -657,12 +657,22 @@ fn build_status_json(
     })
 }
 
+fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+    }
+}
+
 async fn handle_connection(
     mut socket: TcpStream,
     ctx: Arc<RuntimeServerContext>,
 ) -> Result<()> {
-    let peer_ip = socket.peer_addr().ok().map(|addr| addr.ip());
-    let peer_is_loopback = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
+    let peer_ip = socket.peer_addr().ok().map(|addr| normalize_peer_ip(addr.ip()));
+    let local_ip = socket.local_addr().ok().map(|addr| normalize_peer_ip(addr.ip()));
+    let peer_is_loopback = peer_ip
+        .map(|ip| ip.is_loopback() || local_ip == Some(ip))
+        .unwrap_or(false);
 
     if let Some(ip) = peer_ip {
         if !ctx.site_config.is_peer_ip_authorized(ip) {
@@ -2018,38 +2028,152 @@ fn ensure_libreoffice_first_run_check(storage: &dragon_storage::DragonStorage) -
     }
 }
 
+fn normalize_explorer_path(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let s = if let Some(rest) = trimmed.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else if let Some(rest) = trimmed.strip_prefix("//?/UNC/") {
+        format!(r"\\{}", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("//?/") {
+        rest.to_string()
+    } else {
+        trimmed.to_string()
+    }
+    .replace('/', "\\");
+
+    let is_unc = s.starts_with(r"\\");
+    let body = if is_unc { &s[2..] } else { s.as_str() };
+    let mut collapsed = String::with_capacity(s.len());
+    if is_unc {
+        collapsed.push_str(r"\\");
+    }
+    let mut prev_sep = false;
+    for ch in body.chars() {
+        if ch == '\\' {
+            if !prev_sep {
+                collapsed.push(ch);
+                prev_sep = true;
+            }
+        } else {
+            collapsed.push(ch);
+            prev_sep = false;
+        }
+    }
+    while collapsed.len() > 3 && collapsed.ends_with('\\') {
+        collapsed.pop();
+    }
+    collapsed
+}
+
+#[cfg(windows)]
+fn resolve_explorer_exe() -> String {
+    if let Ok(root) = std::env::var("SystemRoot") {
+        let candidate = Path::new(&root).join("explorer.exe");
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    let fallback = Path::new(r"C:\Windows\explorer.exe");
+    if fallback.is_file() {
+        return fallback.to_string_lossy().into_owned();
+    }
+    "explorer.exe".to_string()
+}
+
+#[cfg(windows)]
+fn open_with_shell_select(target: &str) -> std::result::Result<(), String> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
+
+    let target_owned = target.to_string();
+    let handle = std::thread::spawn(move || -> std::result::Result<(), String> {
+        let wide: Vec<u16> = OsStr::new(&target_owned)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let co_hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let did_init = co_hr.is_ok();
+            let pidl = ILCreateFromPathW(PCWSTR(wide.as_ptr()));
+            let res = if pidl.is_null() {
+                Err("ILCreateFromPathW devolvió nulo para la ruta solicitada".to_string())
+            } else {
+                let r = SHOpenFolderAndSelectItems(pidl, None, 0)
+                    .map_err(|e| format!("SHOpenFolderAndSelectItems: {}", e));
+                ILFree(Some(pidl));
+                r
+            };
+            if did_init {
+                CoUninitialize();
+            }
+            res
+        }
+    });
+
+    handle
+        .join()
+        .map_err(|_| "Fallo interno al abrir el Explorador".to_string())?
+}
+
 fn open_in_explorer(file: &str) -> serde_json::Value {
-    let p = Path::new(file);
+    let normalized = normalize_explorer_path(file);
+    let p = Path::new(&normalized);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        if p.is_file() {
-            let clean = file.replace('"', "");
-            let res = std::process::Command::new("explorer.exe")
-                .raw_arg(format!("/select,\"{}\"", clean))
-                .spawn();
-            return match res {
-                Ok(_) => json!({ "opened": true, "mode": "select_file", "target": clean }),
-                Err(e) => json!({ "opened": false, "error": e.to_string() }),
-            };
+
+        let (target, select_file, mode) = if p.is_file() {
+            (normalized.clone(), true, "select_file")
         } else if p.is_dir() {
-            let res = std::process::Command::new("explorer.exe").arg(p).spawn();
-            return match res {
-                Ok(_) => json!({ "opened": true, "mode": "open_dir", "target": file }),
-                Err(e) => json!({ "opened": false, "error": e.to_string() }),
-            };
+            (normalized.clone(), false, "open_dir")
         } else if let Some(parent) = p.parent().filter(|d| d.is_dir()) {
-            let res = std::process::Command::new("explorer.exe").arg(parent).spawn();
-            return match res {
-                Ok(_) => json!({
-                    "opened": true,
-                    "mode": "open_parent",
-                    "target": parent.to_string_lossy()
-                }),
-                Err(e) => json!({ "opened": false, "error": e.to_string() }),
-            };
+            (
+                normalize_explorer_path(&parent.to_string_lossy()),
+                false,
+                "open_parent",
+            )
+        } else {
+            return json!({
+                "opened": false,
+                "error": "Ruta no encontrada en el equipo",
+                "target": normalized
+            });
+        };
+
+        // En sesión interactiva del usuario: preferir SHOpenFolderAndSelectItems (maneja comas,
+        // tildes, espacios y trae la ventana del Explorador al frente).
+        if select_file && open_with_shell_select(&target).is_ok() {
+            return json!({
+                "opened": true,
+                "mode": mode,
+                "target": target
+            });
         }
-        return json!({ "opened": false, "error": "Ruta no encontrada en el equipo" });
+
+        let explorer_exe = resolve_explorer_exe();
+        let clean = target.replace('"', "");
+        let res = if select_file {
+            std::process::Command::new(&explorer_exe)
+                .raw_arg(format!("/select,\"{}\"", clean))
+                .spawn()
+        } else {
+            std::process::Command::new(&explorer_exe)
+                .arg(&clean)
+                .spawn()
+        };
+
+        return match res {
+            Ok(_) => json!({ "opened": true, "mode": mode, "target": clean }),
+            Err(e) => json!({ "opened": false, "error": e.to_string(), "target": clean }),
+        };
     }
     #[cfg(not(windows))]
     {
@@ -2961,6 +3085,29 @@ async fn send_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_explorer_path_cleans_prefixes_and_slashes() {
+        assert_eq!(
+            normalize_explorer_path(r"\\?\D:\Docs\Informe 2026.pdf"),
+            r"D:\Docs\Informe 2026.pdf"
+        );
+        assert_eq!(
+            normalize_explorer_path(r"\\?\UNC\srv\compartido\acta.docx"),
+            r"\\srv\compartido\acta.docx"
+        );
+        assert_eq!(
+            normalize_explorer_path("D:/PROYECTOS//Carpeta/archivo, prueba.pdf"),
+            r"D:\PROYECTOS\Carpeta\archivo, prueba.pdf"
+        );
+        assert_eq!(normalize_explorer_path(r"C:\"), r"C:\");
+    }
+
+    #[test]
+    fn normalize_peer_ip_maps_v4_mapped_loopback() {
+        let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(normalize_peer_ip(mapped).is_loopback());
+    }
 
     #[test]
     fn urlencoding_decode_handles_utf8_spanish_paths() {
