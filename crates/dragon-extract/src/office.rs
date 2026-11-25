@@ -32,6 +32,7 @@ pub struct ArchiveEntryPreview {
 }
 
 /// Extrae texto plano de un documento Word (.docx), incluyendo cuerpo, encabezados, pies y comentarios.
+/// Preserva la continuidad de palabras partidas entre múltiples `<w:t>` dentro de un mismo `<w:p>`.
 pub fn extract_docx_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<String> {
     let file = File::open(path.as_ref())?;
     let mut archive = zip::ZipArchive::new(file)?;
@@ -40,7 +41,7 @@ pub fn extract_docx_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<St
     if let Ok(mut doc_xml) = archive.by_name("word/document.xml") {
         let mut xml_content = String::new();
         if doc_xml.read_to_string(&mut xml_content).is_ok() {
-            if let Ok(text) = extract_xml_tags(&xml_content, &["w:t", "t"], max_chars) {
+            if let Ok(text) = extract_word_xml_text(&xml_content, max_chars) {
                 full_text.push_str(&text);
             }
         }
@@ -65,9 +66,11 @@ pub fn extract_docx_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<St
             let mut xml_content = String::new();
             if entry.read_to_string(&mut xml_content).is_ok() {
                 let rem = max_chars.saturating_sub(full_text.len());
-                if let Ok(extra) = extract_xml_tags(&xml_content, &["w:t", "t"], rem) {
+                if let Ok(extra) = extract_word_xml_text(&xml_content, rem) {
                     if !extra.is_empty() {
-                        full_text.push('\n');
+                        if !full_text.is_empty() {
+                            full_text.push('\n');
+                        }
                         full_text.push_str(&extra);
                     }
                 }
@@ -78,23 +81,51 @@ pub fn extract_docx_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<St
     Ok(full_text)
 }
 
-/// Extrae texto plano de una hoja de cálculo Excel (.xlsx/.xlsm), leyendo sharedStrings y hojas XML.
+/// Extrae texto plano de una hoja de cálculo Excel (.xlsx/.xlsm), leyendo nombres de hojas,
+/// `sharedStrings` (sin partir runs enriquecidos), `inlineStr` y valores numéricos/fórmulas (`<v>`).
 pub fn extract_xlsx_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<String> {
     let file = File::open(path.as_ref())?;
     let mut archive = zip::ZipArchive::new(file)?;
     let mut full_text = String::with_capacity(2048);
 
-    // 1. Cadenas compartidas (opcional en XLSX generados por herramientas externas)
-    if let Ok(mut shared) = archive.by_name("xl/sharedStrings.xml") {
-        let mut xml_content = String::new();
-        if shared.read_to_string(&mut xml_content).is_ok() {
-            if let Ok(text) = extract_xml_tags(&xml_content, &["t"], max_chars) {
-                full_text.push_str(&text);
+    // 0. Nombres de pestañas/hojas desde workbook.xml
+    let sheet_targets = resolve_xlsx_sheet_targets(&mut archive);
+    for (sheet_name, _) in &sheet_targets {
+        if full_text.len() >= max_chars {
+            break;
+        }
+        let trimmed = sheet_name.trim();
+        if !trimmed.is_empty() {
+            if !full_text.is_empty() {
+                full_text.push(' ');
+            }
+            full_text.push_str(trimmed);
+        }
+    }
+
+    // 1. Cadenas compartidas preservando runs enriquecidos <si><r><t>...</t></r></si> sin partir palabras
+    if full_text.len() < max_chars {
+        if let Ok(mut shared) = archive.by_name("xl/sharedStrings.xml") {
+            let mut xml_content = String::new();
+            if shared.read_to_string(&mut xml_content).is_ok() {
+                let strings = parse_xlsx_shared_strings(&xml_content);
+                for s in strings {
+                    if full_text.len() >= max_chars {
+                        break;
+                    }
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        if !full_text.is_empty() {
+                            full_text.push('\n');
+                        }
+                        full_text.push_str(trimmed);
+                    }
+                }
             }
         }
     }
 
-    // 2. Celdas inlineStr (<t>) y valores numéricos/fórmulas (<v>) en cada hoja
+    // 2. Celdas inlineStr (<is>) y valores numéricos / resultados de fórmulas (<v> donde t != "s")
     for i in 0..archive.len() {
         if full_text.len() >= max_chars {
             break;
@@ -107,11 +138,12 @@ pub fn extract_xlsx_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<St
             let mut xml_content = String::new();
             if entry.read_to_string(&mut xml_content).is_ok() {
                 let rem = max_chars.saturating_sub(full_text.len());
-                if let Ok(sheet_text) = extract_xml_tags(&xml_content, &["t", "is"], rem) {
-                    if !sheet_text.is_empty() {
+                let sheet_text = extract_xlsx_sheet_values_and_inline(&xml_content, rem);
+                if !sheet_text.is_empty() {
+                    if !full_text.is_empty() {
                         full_text.push('\n');
-                        full_text.push_str(&sheet_text);
                     }
+                    full_text.push_str(&sheet_text);
                 }
             }
         }
@@ -120,7 +152,8 @@ pub fn extract_xlsx_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<St
     Ok(full_text)
 }
 
-/// Extrae texto de presentaciones PowerPoint (.pptx), incluyendo diapositivas y notas del orador.
+/// Extrae texto de presentaciones PowerPoint (.pptx), incluyendo diapositivas y notas del orador,
+/// uniendo runs `<a:t>` dentro de cada párrafo `<a:p>` sin partir palabras.
 pub fn extract_pptx_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<String> {
     let file = File::open(path.as_ref())?;
     let mut archive = zip::ZipArchive::new(file)?;
@@ -139,14 +172,18 @@ pub fn extract_pptx_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<St
         {
             let mut xml_content = String::new();
             if entry.read_to_string(&mut xml_content).is_ok() {
-                if let Ok(slide_text) = extract_xml_tags(
-                    &xml_content,
-                    &["a:t", "t"],
-                    max_chars.saturating_sub(full_text.len()),
-                ) {
-                    if !slide_text.is_empty() {
-                        full_text.push_str(&slide_text);
-                        full_text.push('\n');
+                let rem = max_chars.saturating_sub(full_text.len());
+                if let Ok(paras) = extract_xml_paragraphs(&xml_content, b"a:p", &[b"a:t", b"t"], rem) {
+                    for p in paras {
+                        if full_text.len() >= max_chars {
+                            break;
+                        }
+                        if !p.is_empty() {
+                            if !full_text.is_empty() {
+                                full_text.push('\n');
+                            }
+                            full_text.push_str(&p);
+                        }
                     }
                 }
             }
@@ -255,7 +292,8 @@ fn is_ole_metadata_noise(s: &str) -> bool {
     )
 }
 
-/// Extrae texto de documentos OpenDocument (.odt, .ods, .odp) leyendo `content.xml`.
+/// Extrae texto de documentos OpenDocument (.odt, .ods, .odp) leyendo `content.xml`
+/// sin partir palabras separadas entre nodos `<text:span>`.
 pub fn extract_opendocument_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<String> {
     let file = File::open(path.as_ref())?;
     let mut archive = zip::ZipArchive::new(file)?;
@@ -265,7 +303,7 @@ pub fn extract_opendocument_text<P: AsRef<Path>>(path: P, max_chars: usize) -> R
 
     let mut xml_content = String::new();
     content_xml.read_to_string(&mut xml_content)?;
-    extract_xml_tags(&xml_content, &["text:p", "text:h", "text:span"], max_chars)
+    extract_odf_xml_text(&xml_content, max_chars)
 }
 
 /// Extrae texto limpio de libros electrónicos EPUB leyendo archivos XHTML/HTML del paquete ZIP.
@@ -374,6 +412,237 @@ pub fn extract_rtf_text<P: AsRef<Path>>(path: P, max_chars: usize) -> Result<Str
         }
     }
     Ok(out)
+}
+
+/// Extrae texto de XML de Word (`word/document.xml`, encabezados, pies, comentarios)
+/// preservando runs `<w:t>` unidos dentro de cada párrafo `<w:p>` para no partir palabras.
+fn extract_word_xml_text(xml: &str, max_chars: usize) -> Result<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut output = String::with_capacity(2048);
+    let mut in_text = false;
+    let mut buf = Vec::new();
+
+    loop {
+        if output.len() >= max_chars {
+            break;
+        }
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let qname = e.name();
+                let name = qname.as_ref();
+                if name == b"w:t" || name == b"t" {
+                    in_text = true;
+                } else if name == b"w:tab" {
+                    if !output.ends_with(' ') && !output.ends_with('\n') {
+                        output.push(' ');
+                    }
+                } else if name == b"w:br" || name == b"w:cr" {
+                    if !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                let qname = e.name();
+                let name = qname.as_ref();
+                if name == b"w:tab" {
+                    if !output.ends_with(' ') && !output.ends_with('\n') {
+                        output.push(' ');
+                    }
+                } else if name == b"w:br" || name == b"w:cr" {
+                    if !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let qname = e.name();
+                let name = qname.as_ref();
+                if name == b"w:t" || name == b"t" {
+                    in_text = false;
+                } else if name == b"w:p" {
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                } else if name == b"w:tc" {
+                    if !output.is_empty() && !output.ends_with(' ') && !output.ends_with('\n') {
+                        output.push(' ');
+                    }
+                }
+            }
+            Ok(Event::Text(e)) if in_text => {
+                if let Ok(text) = e.unescape() {
+                    output.push_str(&text);
+                }
+            }
+            Ok(Event::CData(e)) if in_text => {
+                output.push_str(&String::from_utf8_lossy(e.as_ref()));
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                log::debug!("Error parcial parseando XML de Word: {:?}", e);
+                break;
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(output)
+}
+
+/// Extrae valores numéricos, resultados de fórmulas (`<v>` cuando `t != "s"`) y cadenas en línea (`<is>`)
+/// de una hoja Excel `xl/worksheets/sheet*.xml`, omitiendo índices de `sharedStrings` (`t="s"`).
+fn extract_xlsx_sheet_values_and_inline(xml: &str, max_chars: usize) -> String {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut output = String::with_capacity(1024);
+    let mut cell_type = String::new();
+    let mut in_v = false;
+    let mut in_is = false;
+    let mut in_t = false;
+    let mut cell_buf = String::new();
+    let mut buf = Vec::new();
+
+    loop {
+        if output.len() >= max_chars {
+            break;
+        }
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let qname = e.name();
+                match qname.as_ref() {
+                    b"c" => {
+                        cell_type.clear();
+                        cell_buf.clear();
+                        in_v = false;
+                        in_is = false;
+                        in_t = false;
+                        for attr in e.attributes().flatten() {
+                            if attr.key.as_ref() == b"t" {
+                                cell_type = attr.unescape_value().unwrap_or_default().to_string();
+                            }
+                        }
+                    }
+                    b"v" => {
+                        in_v = true;
+                        cell_buf.clear();
+                    }
+                    b"is" => {
+                        in_is = true;
+                        cell_buf.clear();
+                    }
+                    b"t" if in_is => {
+                        in_t = true;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let qname = e.name();
+                match qname.as_ref() {
+                    b"v" => in_v = false,
+                    b"t" => in_t = false,
+                    b"is" => in_is = false,
+                    b"c" => {
+                        // Omitir índices de sharedStrings ("s"), booleanos ("b") y errores ("e")
+                        if !matches!(cell_type.as_str(), "s" | "b" | "e") {
+                            let trimmed = cell_buf.trim();
+                            if !trimmed.is_empty() {
+                                if !output.is_empty() {
+                                    output.push(' ');
+                                }
+                                output.push_str(trimmed);
+                            }
+                        }
+                        cell_buf.clear();
+                        cell_type.clear();
+                    }
+                    b"row" => {
+                        if !output.is_empty() && !output.ends_with('\n') {
+                            output.push('\n');
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(e)) if in_v || (in_is && in_t) => {
+                if let Ok(t) = e.unescape() {
+                    cell_buf.push_str(&t);
+                }
+            }
+            Ok(Event::CData(e)) if in_v || (in_is && in_t) => {
+                cell_buf.push_str(&String::from_utf8_lossy(e.as_ref()));
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    output
+}
+
+/// Extrae texto de OpenDocument (`content.xml`) concatenando `<text:span>` dentro de `<text:p>`/`<text:h>`.
+fn extract_odf_xml_text(xml: &str, max_chars: usize) -> Result<String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+
+    let mut output = String::with_capacity(2048);
+    let mut para_depth = 0usize;
+    let mut buf = Vec::new();
+
+    loop {
+        if output.len() >= max_chars {
+            break;
+        }
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let qname = e.name();
+                let name = qname.as_ref();
+                if name == b"text:p" || name == b"text:h" {
+                    para_depth += 1;
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                if para_depth > 0 {
+                    let qname = e.name();
+                    let name = qname.as_ref();
+                    if name == b"text:s" || name == b"text:tab" {
+                        output.push(' ');
+                    } else if name == b"text:line-break" {
+                        output.push('\n');
+                    }
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                let qname = e.name();
+                let name = qname.as_ref();
+                if name == b"text:p" || name == b"text:h" {
+                    para_depth = para_depth.saturating_sub(1);
+                    if !output.is_empty() && !output.ends_with('\n') {
+                        output.push('\n');
+                    }
+                }
+            }
+            Ok(Event::Text(e)) if para_depth > 0 => {
+                if let Ok(t) = e.unescape() {
+                    output.push_str(&t);
+                }
+            }
+            Ok(Event::CData(e)) if para_depth > 0 => {
+                output.push_str(&String::from_utf8_lossy(e.as_ref()));
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(output)
 }
 
 /// Parsea un string XML y extrae el texto contenido en las etiquetas especificadas soportando anidamiento.
@@ -975,5 +1244,44 @@ mod tests {
         assert_eq!(total, 2);
         assert_eq!(rows[0], vec!["Producto", "", "Total"]);
         assert_eq!(rows[1], vec!["Laptop", "", "1500"]);
+    }
+
+    #[test]
+    fn word_and_odf_xml_do_not_split_words_across_runs() {
+        let word_xml = r#"<w:document><w:body>
+            <w:p>
+                <w:r><w:t>Resoluci</w:t></w:r>
+                <w:r><w:t>ón</w:t></w:r>
+                <w:r><w:t xml:space="preserve"> número </w:t></w:r>
+                <w:r><w:t>7870</w:t></w:r>
+            </w:p>
+            <w:p>
+                <w:r><w:t>Telem</w:t></w:r><w:r><w:t>ática</w:t></w:r>
+            </w:p>
+        </w:body></w:document>"#;
+        let text = extract_word_xml_text(word_xml, 4096).unwrap();
+        assert!(text.contains("Resolución número 7870"), "got: {text:?}");
+        assert!(text.contains("Telemática"), "got: {text:?}");
+
+        let odf_xml = r#"<office:text><text:p>Informa<text:span>ción</text:span><text:s/>2026</text:p></office:text>"#;
+        let odf_text = extract_odf_xml_text(odf_xml, 4096).unwrap();
+        assert!(odf_text.contains("Información 2026"), "got: {odf_text:?}");
+    }
+
+    #[test]
+    fn xlsx_sheet_extractor_captures_numbers_and_formulas_while_skipping_shared_indices() {
+        let sheet_xml = r#"<worksheet><sheetData>
+            <row r="1">
+                <c r="A1" t="s"><v>99</v></c>
+                <c r="B1"><v>1089196342</v></c>
+                <c r="C1" t="str"><f>CONCAT("RAD-",1)</f><v>RAD-2026001</v></c>
+                <c r="D1" t="inlineStr"><is><r><t>Tele</t></r><r><t>mática</t></r></is></c>
+            </row>
+        </sheetData></worksheet>"#;
+        let extracted = extract_xlsx_sheet_values_and_inline(sheet_xml, 4096);
+        assert!(extracted.contains("1089196342"), "got: {extracted:?}");
+        assert!(extracted.contains("RAD-2026001"), "got: {extracted:?}");
+        assert!(extracted.contains("Telemática"), "got: {extracted:?}");
+        assert!(!extracted.contains("99"), "sharedStrings index must not leak: {extracted:?}");
     }
 }

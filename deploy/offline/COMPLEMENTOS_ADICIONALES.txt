@@ -1,0 +1,94 @@
+RADAR DEL DRAGON - COMPLEMENTOS ADICIONALES (OPCIONALES)
+========================================================
+
+El paquete offline YA INCLUYE todo lo necesario para funcionar sin Internet:
+  - Binario nativo Rust x64 (dragon.exe) compilado con CRT estatico (+crt-static):
+    NO requiere Visual C++ Redistributable, Python, Node.js ni .NET adicional.
+  - Motor de escaneo NTFS MFT + respaldo multi-hilo jwalk.
+  - Base de datos embebida ACID (redb) + busqueda de texto completo BM25 (Tantivy)
+    + busqueda semantica local (256 dimensiones).
+  - Interfaz web 100% autocontenida (sin CDN, sin Google Fonts ni acceso a Internet).
+  - Vista previa integrada OOXML para Word (.docx), Excel (.xlsx), PowerPoint (.pptx),
+    PDF, imagenes, audio/video, texto/codigo y archivos .zip.
+
+
+REQUISITOS DEL EQUIPO
+---------------------
+  Sistema:        Windows 10 u 11 de 64 bits (x64). No ARM64 ni 32 bits.
+  Memoria RAM:    4 GB minimo; 8 GB recomendado para equipos con cientos de miles de archivos.
+  Disco:          50 MB para el programa + espacio para indices locales (tipicamente 100-500 MB).
+  Navegador:      Microsoft Edge (incluido en Windows), Chrome o Firefox actualizados.
+  Permisos:       No requiere administrador (se instala en %LOCALAPPDATA%\Radar-del-Dragon).
+                  Nota: permisos de administrador solo aceleran el escaneo MFT directo;
+                  sin administrador funciona automaticamente con el escaner paralelo.
+
+
+1) REGLA DE FIREWALL  ->  compartir Radar del Dragon en la LAN (puerto 8092)
+----------------------------------------------------------------------------
+  Necesario solo si usa el acceso "Radar del Dragon (compartir en LAN)".
+  En modo local (acceso "Radar del Dragon") no se abre ningun puerto de red.
+  Ejecute en PowerShell como ADMINISTRADOR indicando la subred autorizada:
+
+    powershell -ExecutionPolicy Bypass -File "%LOCALAPPDATA%\Radar-del-Dragon\herramientas\configure-firewall.ps1" -AuthorizedSubnet 192.168.1.0/24 -Port 8092 -Apply
+
+  - Sin -Apply solo muestra un diagnostico sin modificar el firewall.
+  - Sustituya 192.168.1.0/24 por su subred real (por ejemplo 172.23.174.0/24).
+  - Si el puerto 8092 estaba ocupado, el lanzador usa 8093-8101: indique el puerto
+    mostrado en el aviso de lanzamiento.
+
+
+2) CONFIGURACION HIBRIDA LAN  ->  config\site_config.json
+---------------------------------------------------------
+  Archivo ubicado en: %LOCALAPPDATA%\Radar-del-Dragon\config\site_config.json
+
+  Modo A - Agente local por PC (predeterminado):
+    {
+      "port": 8092,
+      "lan_mode": "local_agent",
+      "shared_paths": [],
+      "libreoffice_path": ""
+    }
+    Cada equipo de la LAN descarga su motor ligero desde este equipo y busca solo
+    en sus propios discos locales.
+
+  Modo B - Repositorio central compartido (0 instalacion en clientes):
+    {
+      "port": 8092,
+      "lan_mode": "shared_server",
+      "shared_paths": [
+        "D:\\Repositorio_Equipo",
+        "D:\\Documentos_Compartidos"
+      ],
+      "libreoffice_path": ""
+    }
+    El servidor indexa exclusivamente las carpetas de "shared_paths" y bloquea
+    cualquier intento de acceso fuera de esas rutas. Los clientes LAN buscan,
+    previsualizan y descargan archivos directamente en el navegador.
+
+
+3) LIBREOFFICE (OPCIONAL)  ->  Renderizado PDF exacto de Word / Excel / PowerPoint
+----------------------------------------------------------------------------------
+  Necesario solo si desea vista previa fiel por paginas PDF para documentos Office
+  (.docx, .doc, .xlsx, .xls, .pptx, .ppt, .odt, .ods, .odp, .rtf).
+  Sin LibreOffice, Radar del Dragon sigue funcionando normalmente con su visor OOXML
+  integrado para .docx, .xlsx y .pptx.
+
+  Descarga:        https://www.libreoffice.org/download/download-libreoffice/
+                   Elija "Windows x86_64" -> archivo .msi completo (instalacion offline).
+  Deteccion:       Automatica en C:\Program Files\LibreOffice\program\soffice.com
+                   o en el PATH del sistema.
+  Ruta distinta:   Indiquela en config\site_config.json (con barras dobles):
+                     "libreoffice_path": "D:\\Apps\\LibreOffice\\program\\soffice.com"
+                   y reinicie Radar del Dragon.
+
+
+4) SOLO EN CASO DE ERROR
+------------------------
+  La politica de la empresa bloquea scripts de PowerShell:
+    - Modo local: ejecute directamente  dragon.exe ui --port 8092
+    - Modo LAN:   ejecute directamente  dragon.exe ui --lan --port 8092
+    y abra http://127.0.0.1:8092/ en el navegador.
+
+  El antivirus o SmartScreen advierte sobre dragon.exe (binario sin firma digital):
+    Solicite a TI autorizar la carpeta %LOCALAPPDATA%\Radar-del-Dragon o el hash SHA256
+    de dragon.exe publicado en SHA256SUMS.txt / PAQUETE-INFO.txt.

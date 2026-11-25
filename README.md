@@ -77,10 +77,22 @@ La carpeta [`PORTABLE`](file:///C:/Users/Drhapso/Documents/PROYECTOS%20IA%20INDE
 
 ---
 
-## 🌐 Uso estándar y en Red LAN
+## 🌐 Uso estándar, Primera Vez, Paquete Instalador Offline y Red LAN (Puerto `8092`)
 
-- **Uso normal en este PC**: ejecuta **`iniciar_radar.bat`** o **`dragon.exe`**.
-- **Modo servidor LAN** *(solo edición estándar)*: ejecuta `dragon.exe ui --lan` para exponer el HUD en la red local (`0.0.0.0`). Cada computadora cliente descarga o activa su motor local aislado para buscar exclusivamente en sus propios discos.
+- **Instalación completa desde cero (equipos externos)**: ejecuta **`CONFIGURAR_PRIMERA_VEZ.bat`** (o `.\configurar_primera_vez.ps1`) para instalar dependencias faltantes (MSVC C++ Build Tools + Rust), crear `config\site_config.json` y compilar `.\dragon.exe`. Consulta la guía detallada en [`GUIA_INSTALACION_COMPLETA.md`](GUIA_INSTALACION_COMPLETA.md).
+- **Modo Solo Local (sin depender de `PORTABLE\`)**: ejecuta **`servidor local.bat`** (abre `127.0.0.1:8092`) o `.\deploy\run-lan.ps1 -LocalOnly -OpenBrowser`.
+- **Modo Servidor Local en LAN**: ejecuta **`servidor para LAN.bat`** (`0.0.0.0:8092`) o `.\deploy\run-lan.ps1`.
+- **Paquete Instalador Offline para cada equipo (estilo EVA PDF Enterprise)**:
+  - Ejecuta `.\deploy\build-offline-package.ps1` para generar `dist\Radar-del-Dragon-Offline-1.3.0-win-x64.zip` y su huella `.sha256.txt`.
+  - Copia el ZIP a cualquier PC Windows 10/11 x64, descomprímelo y haz doble clic en **`INSTALAR.bat`** *(sin permisos de administrador y sin Internet)*.
+  - Instala en `%LOCALAPPDATA%\Radar-del-Dragon`, valida integridad SHA-256 y crea los accesos directos:
+    - **`Radar del Dragon`** (modo local `127.0.0.1:8092`, sin abrir puertos de red)
+    - **`Radar del Dragon (compartir en LAN)`** (`0.0.0.0:8092`, con aviso de IPs LAN)
+    - **`Desinstalar Radar del Dragon`**
+- **Modo LAN híbrido configurable (`config\site_config.json`)**:
+  - `"lan_mode": "local_agent"` *(predeterminado)*: el equipo anfitrión sirve el HUD web y cada PC cliente activa su motor local para buscar exclusivamente en sus propios discos.
+  - `"lan_mode": "shared_server"`: el equipo anfitrión indexa únicamente las carpetas listadas en `"shared_paths"` (en un índice aislado) y los clientes de la LAN buscan, previsualizan y descargan directo desde el navegador sin instalar nada.
+- **Regla de Firewall LAN**: usa `deploy\configure-firewall.ps1 -AuthorizedSubnet <CIDR> -Port 8092 -Apply` como administrador.
 - **Indexación manual anticipada**: ejecuta **`indexar_equipo.bat`** o **`indexar_equipo.ps1`**.
 
 Para detalles técnicos de arquitectura, endpoints REST, esquema de tablas `redb` y compilación, consulta [`DOCUMENTACION.md`](file:///C:/Users/Drhapso/Documents/PROYECTOS%20IA%20INDEPENDIENTES/RADAR%20DEL%20DRAGON/RADAR%20DRAGON%20TOOL/DOCUMENTACION.md).

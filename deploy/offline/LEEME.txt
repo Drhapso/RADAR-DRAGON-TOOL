@@ -1,0 +1,61 @@
+RADAR DEL DRAGON - INSTALADOR OFFLINE PARA WINDOWS x64
+======================================================
+
+INSTALAR (sin Internet y sin permisos de administrador)
+  1. Extraiga TODO el ZIP en una carpeta (clic derecho > Extraer todo).
+     No ejecute el instalador desde dentro del ZIP.
+  2. Doble clic en  INSTALAR.bat
+     - Verifica la integridad (SHA256) de todos los archivos del paquete.
+     - Copia Radar del Dragon a  %LOCALAPPDATA%\Radar-del-Dragon
+     - Crea config\site_config.json (conservandolo intacto en actualizaciones).
+     - Crea accesos directos en el Escritorio y en Inicio > Radar del Dragon.
+  3. Abra el acceso directo "Radar del Dragon". El navegador se abre en
+     http://127.0.0.1:8092/  (si el puerto esta ocupado usa 8093-8101).
+
+  Carpeta distinta:  INSTALAR.bat -InstallDir "D:\Apps\Radar-del-Dragon"
+  Sin accesos:       INSTALAR.bat -NoShortcuts
+
+USO LOCAL Y EN RED LAN (HIBRIDO)
+  - "Radar del Dragon": solo este equipo (127.0.0.1:8092). No abre puertos de red.
+  - "Radar del Dragon (compartir en LAN)": escucha en 0.0.0.0:8092 para otros equipos
+    de la red local; requiere la regla de firewall (ver COMPLEMENTOS_ADICIONALES.txt).
+  - El motor corre en la ventana minimizada de dragon.exe. Cerrarla lo detiene.
+
+MODOS LAN CONFIGURABLES EN  config\site_config.json
+  1) "lan_mode": "local_agent"  (predeterminado)
+     Otros equipos de la LAN abren http://<IP>:8092/ y pulsan "ACTIVAR EN ESTE EQUIPO"
+     para indexar y buscar exclusivamente SUS PROPIOS discos locales. Los archivos del
+     equipo anfitrion nunca quedan expuestos en la red.
+
+  2) "lan_mode": "shared_server"
+     El equipo anfitrion indexa unicamente las carpetas declaradas en "shared_paths"
+     (en un indice separado del indice personal) y cualquier equipo de la LAN busca,
+     previsualiza y descarga archivos directo desde el navegador sin instalar nada.
+     Ejemplo de config\site_config.json:
+       {
+         "port": 8092,
+         "lan_mode": "shared_server",
+         "shared_paths": [
+           "D:\\Documentos_Compartidos",
+           "D:\\Normativa_Interna"
+         ],
+         "libreoffice_path": ""
+       }
+
+ACTUALIZAR
+  Ejecute INSTALAR.bat de la nueva version con Radar del Dragon cerrado. Se conservan
+  config\site_config.json y sus indices locales (.dragon-data, .dragon-index,
+  .dragon-shared-data, .dragon-shared-index y .dragon-models).
+
+DESINSTALAR
+  Inicio > Radar del Dragon > "Desinstalar Radar del Dragon" (pregunta si conservar datos).
+
+COMPLEMENTOS
+  Lea COMPLEMENTOS_ADICIONALES.txt: regla de Firewall LAN (puerto 8092), LibreOffice
+  opcional (renderizado PDF exacto de Word/Excel/PowerPoint) y solucion de problemas.
+
+CONTENIDO DEL PAQUETE
+  INSTALAR.bat / INSTALAR.ps1      Instalador offline con verificacion SHA256.
+  Dragon-Radar\                    Motor nativo (dragon.exe + config\site_config.example.json).
+  app\                             Lanzador, desinstalador y herramientas\configure-firewall.ps1.
+  PAQUETE-INFO.txt                 Version, fecha y huellas SHA256.

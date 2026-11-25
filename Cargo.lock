@@ -514,6 +514,7 @@ dependencies = [
  "anyhow",
  "dragon-core",
  "log",
+ "rayon",
  "redb",
  "serde",
  "serde_json",

@@ -65,6 +65,13 @@ impl VectorStore {
         self.units.is_empty()
     }
 
+    /// Recupera en O(1) desde RAM el extracto almacenado de un documento por ruta (0 I/O de disco).
+    pub fn get_snippet_by_path(&self, path: &str) -> Option<&str> {
+        let key = vector_path_key(path);
+        let &idx = self.path_map.get(&key)?;
+        self.units.get(idx).map(|u| u.snippet.as_str()).filter(|s| !s.is_empty())
+    }
+
     /// Agrega o actualiza (sin duplicar) una unidad vectorial al almacén según su ruta.
     pub fn upsert(&mut self, doc_id: u64, path: &str, chunk_index: u32, snippet: &str, vector: &[f32]) {
         assert_eq!(vector.len(), self.dim, "Dimensión del vector no coincide");

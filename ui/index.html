@@ -5,9 +5,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Dragon Radar Tool - Anime Edition</title>
     <link rel="stylesheet" href="styles.css">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Chakra+Petch:wght@600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 </head>
 <body class="anime-world">
     <!-- Cielo estilo Dragon Ball (Toriyama clouds) -->
@@ -86,7 +83,7 @@
             <section class="search-feed-panel">
                 <div class="search-box-wrapper">
                     <span class="prompt-symbol">▶</span>
-                    <input type="text" id="searchInput" class="tactical-input" placeholder="BUSCAR ARCHIVOS, TEXTO O EXTENSIÓN (EJ: .PDF, *.XLSX, EXT:DOCX)..." autofocus autocomplete="off" spellcheck="false">
+                    <input type="text" id="searchInput" class="tactical-input" placeholder='BUSCAR ARCHIVOS O CONTENIDO (EJ: .PDF, "FRASE EXACTA", ACTA*2026, !COPIA, A | B, D:\2025)...' autofocus autocomplete="off" spellcheck="false">
                     <div class="search-mode-toggles">
                         <button class="mode-btn active" data-mode="all">HÍBRIDO</button>
                         <button class="mode-btn" data-mode="documents">DOCS</button>
@@ -110,6 +107,12 @@
                     <a id="lanAgentDownloadBtn" class="lan-banner-btn" href="/api/agent/launcher">ACTIVAR EN ESTE EQUIPO</a>
                 </div>
 
+                <div id="sharedServerBanner" class="shared-server-banner" hidden>
+                    <div class="lan-banner-text" id="sharedServerBannerText">
+                        <strong>Modo LAN Compartido:</strong> Buscando en las carpetas compartidas del servidor.
+                    </div>
+                </div>
+
                 <div id="libreofficeNoticeBanner" class="libreoffice-notice-banner" hidden>
                     <div class="lan-banner-text">
                         <strong>Aviso de primera ejecución:</strong> No se detectó <b>LibreOffice</b> instalado en este equipo. La vista previa integrada funciona con el visor OOXML, pero instalar LibreOffice habilita el renderizado exacto por páginas en Word, Excel y PowerPoint.
@@ -117,11 +120,31 @@
                     <button type="button" id="libreofficeNoticeCloseBtn" class="libreoffice-notice-close" title="Ocultar aviso">&times;</button>
                 </div>
 
+                <div id="indexLiveBar" class="index-live-bar" hidden>
+                    <div class="index-live-top">
+                        <span id="indexLiveText" class="index-live-text">INDEXANDO EN TIEMPO REAL...</span>
+                        <span id="indexLivePct" class="index-live-pct">0%</span>
+                    </div>
+                    <div class="index-progress-track">
+                        <div id="indexProgressFill" class="index-progress-fill" style="width: 0%"></div>
+                    </div>
+                    <div id="indexDrivesList" class="index-drives-list"></div>
+                </div>
+
                 <div class="results-workspace">
-                    <div class="results-container" id="resultsContainer">
-                        <div class="empty-state">
-                            <p class="empty-title">RADAR LISTO PARA RASTREAR</p>
-                            <p class="empty-subtitle">Escribe el nombre de un archivo o el texto dentro de tus documentos</p>
+                    <div class="results-column">
+                        <div id="resultsToolbar" class="results-toolbar" hidden>
+                            <div class="results-toolbar-top">
+                                <span id="resultsCountLabel" class="results-count-label">0 coincidencias</span>
+                                <button type="button" id="expandResultsBtn" class="expand-results-btn" title="Mostrar absolutamente todas las coincidencias sin límite">⊞ EXPANDIR RESULTADOS</button>
+                            </div>
+                            <input type="text" id="resultsQuickFilter" class="results-quick-filter" placeholder="Filtrar dentro de todos los resultados (nombre, ruta o texto)..." autocomplete="off" spellcheck="false" hidden>
+                        </div>
+                        <div class="results-container" id="resultsContainer">
+                            <div class="empty-state">
+                                <p class="empty-title">RADAR LISTO PARA RASTREAR</p>
+                                <p class="empty-subtitle">Escribe el nombre de un archivo o el texto dentro de tus documentos</p>
+                            </div>
                         </div>
                     </div>
 
@@ -152,10 +175,10 @@
 
                 <footer class="hud-footer">
                     <div class="shortcut-tip"><kbd>1 CLICK</kbd> VISTA PREVIA</div>
-                    <div class="shortcut-tip"><kbd>2 CLICKS</kbd> ABRIR UBICACIÓN</div>
+                    <div class="shortcut-tip"><kbd>2 CLICKS</kbd> <span id="shortcutDblClickLabel">ABRIR UBICACIÓN</span></div>
                     <div class="shortcut-tip"><kbd>↑</kbd><kbd>↓</kbd> NAVEGAR</div>
                     <div class="shortcut-tip"><kbd>SPACE</kbd> AMPLIAR</div>
-                    <div class="shortcut-tip"><kbd>ENTER</kbd> ABRIR UBICACIÓN</div>
+                    <div class="shortcut-tip"><kbd>ENTER</kbd> <span id="shortcutEnterLabel">ABRIR UBICACIÓN</span></div>
                     <div class="shortcut-tip"><kbd>CLICK BLIP</kbd> ENFOCAR Y PREVIEW</div>
                 </footer>
             </section>

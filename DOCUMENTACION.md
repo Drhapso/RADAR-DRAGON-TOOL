@@ -99,7 +99,23 @@ lan = []
 
 ---
 
-## 5. Política de Git / GitHub Desktop y Límites de Peso
+## 5. Paquete Instalador Offline y Modo LAN Híbrido (`config/site_config.json`)
+
+- **Puerto oficial**: `8092` (configurable en `config/site_config.json`; el lanzador `Iniciar-Radar.ps1` busca libre entre `8092` y `8101` verificando `GET /health` -> `{"app": "dragon-radar", "status": "ok"}`).
+- **Configuración híbrida (`config/site_config.example.json` -> `config/site_config.json`)**:
+  - `lan_mode = "local_agent"` *(predeterminado)*: las peticiones remotas a `/api/status`, `/api/search`, `/api/preview`, `/api/raw`, `/api/download`, `/api/open` se bloquean (`403`) en el anfitrión; los clientes LAN descargan el activador local y buscan exclusivamente en sus propios discos.
+  - `lan_mode = "shared_server"`: indexa exclusivamente `shared_paths` en un índice aislado (`.dragon-shared-data` / `.dragon-shared-index`), valida contención canónica de rutas en cada petición remota, deshabilita `/api/open` remoto y habilita `GET /api/download` para descarga directa desde el navegador.
+  - `libreoffice_path`: ruta opcional explícita a `soffice.com` / `soffice.exe`.
+- **Interfaz 100 % offline**: sin referencias a Google Fonts ni CDNs externos.
+- **Constructor del instalador offline**:
+  ```powershell
+  .\deploy\build-offline-package.ps1
+  ```
+  Genera `dist\Radar-del-Dragon-Offline-1.3.0-win-x64.zip` + `.sha256.txt` con binario `+crt-static`, `INSTALAR.bat`/`INSTALAR.ps1`, `Iniciar-Radar.ps1`, `Desinstalar-Radar.ps1` y `herramientas\configure-firewall.ps1`.
+
+---
+
+## 6. Política de Git / GitHub Desktop y Límites de Peso
 
 - `.gitignore` ignora `/target/` (incluyendo `target/portable/`), bases de runtime (`.dragon-data/`, `.dragon-index/`, `.dragon-models/`, `PORTABLE/.dragon-data/`, `PORTABLE/.dragon-index/`, `PORTABLE/.dragon-models/`) y ejecutables temporales `*.exe`, **excepto** `!PORTABLE/dragon.exe`.
 - GitHub establece una advertencia en **50 MB** y un límite estricto de rechazo en **100 MB** por archivo individual.

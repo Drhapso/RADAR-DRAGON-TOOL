@@ -6,11 +6,12 @@ use anyhow::{Context, Result};
 use dragon_core::{classify_path, is_noisy_build_or_cache_path, FileCategory};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, RegexQuery, TermQuery};
 use tantivy::schema::*;
 pub use tantivy::IndexWriter;
-use tantivy::{Index, IndexReader, ReloadPolicy};
+use tantivy::{Index, IndexReader, ReloadPolicy, TantivyError};
 
 pub struct DragonIndexEngine {
     index: Index,
@@ -39,6 +40,7 @@ impl DragonIndexEngine {
     pub fn open_or_create<P: AsRef<Path>>(index_dir: P) -> Result<Self> {
         let path = index_dir.as_ref();
         std::fs::create_dir_all(path)?;
+        clear_readonly_flags_in_dir(path);
 
         let mut schema_builder = Schema::builder();
         let field_id = schema_builder.add_u64_field("id", STORED | INDEXED | FAST);
@@ -52,9 +54,11 @@ impl DragonIndexEngine {
         let index = Index::open_or_create(tantivy::directory::MmapDirectory::open(path)?, schema.clone())
             .context("Error abriendo índice Tantivy")?;
 
+        // Usamos ReloadPolicy::Manual porque el indexador recarga explícitamente tras cada commit.
+        // Evita que un watcher en segundo plano bloquee `meta.json` en Windows (os error 5) durante commit().
         let reader = index
             .reader_builder()
-            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .reload_policy(ReloadPolicy::Manual)
             .try_into()?;
 
         Ok(Self {
@@ -70,10 +74,66 @@ impl DragonIndexEngine {
         })
     }
 
-    /// Crea un escritor para indexar documentos (búfer configurable en MB).
+    /// Crea un escritor para indexar documentos (búfer configurable en MB) con reintentos ante
+    /// bloqueos transitorios de Windows (antivirus / os error 5 o 32).
     pub fn create_writer(&self, memory_budget_mb: usize) -> Result<IndexWriter> {
         let budget_bytes = memory_budget_mb * 1024 * 1024;
-        self.index.writer(budget_bytes).context("Error creando IndexWriter")
+        let max_attempts = 6usize;
+        let mut last_err = None;
+        for attempt in 0..max_attempts {
+            match self.index.writer(budget_bytes) {
+                Ok(writer) => return Ok(writer),
+                Err(err) => {
+                    let retryable = is_transient_windows_io_error(&err)
+                        || matches!(err, TantivyError::LockFailure(..));
+                    if retryable && attempt + 1 < max_attempts {
+                        let wait_ms = 120 * (attempt as u64 + 1);
+                        log::warn!(
+                            "Bloqueo transitorio al crear IndexWriter (intento {}/{}): {}; reintentando en {} ms",
+                            attempt + 1,
+                            max_attempts,
+                            err,
+                            wait_ms
+                        );
+                        std::thread::sleep(Duration::from_millis(wait_ms));
+                        last_err = Some(err);
+                        continue;
+                    }
+                    return Err(err).context("Error creando IndexWriter");
+                }
+            }
+        }
+        Err(last_err.unwrap()).context("Error creando IndexWriter tras reintentos")
+    }
+
+    /// Ejecuta `writer.commit()` con reintentos exponenciales ante bloqueos transitorios de Windows
+    /// (`os error 5` Acceso denegado / `os error 32` archivo en uso por Defender o mmap) y recarga el lector.
+    pub fn commit_with_retry(&self, writer: &mut IndexWriter) -> Result<u64> {
+        let max_attempts = 8usize;
+        for attempt in 0..max_attempts {
+            match writer.commit() {
+                Ok(opstamp) => {
+                    let _ = self.reload();
+                    return Ok(opstamp);
+                }
+                Err(err) => {
+                    if is_transient_windows_io_error(&err) && attempt + 1 < max_attempts {
+                        let wait_ms = (80u64 << attempt.min(4)).min(1000);
+                        log::warn!(
+                            "Bloqueo transitorio en commit de Tantivy (intento {}/{}): {}; reintentando en {} ms",
+                            attempt + 1,
+                            max_attempts,
+                            err,
+                            wait_ms
+                        );
+                        std::thread::sleep(Duration::from_millis(wait_ms));
+                        continue;
+                    }
+                    return Err(err).context("Error confirmando cambios en índice Tantivy");
+                }
+            }
+        }
+        anyhow::bail!("No se pudo confirmar el índice Tantivy tras reintentos")
     }
 
     /// Fuerza la recarga del lector para hacer visibles de inmediato los últimos commits.
@@ -135,25 +195,29 @@ impl DragonIndexEngine {
             return Ok(Vec::new());
         }
 
-        let tokens = extract_query_tokens(trimmed);
-        if tokens.is_empty() {
+        let parsed = parse_content_query(trimmed);
+        if parsed.is_empty() {
             return Ok(Vec::new());
         }
 
         let searcher = self.reader.searcher();
-        let candidate_limit = (limit * 20).max(300);
+        let total_docs = (searcher.num_docs() as usize).max(1);
+        let candidate_limit = if limit >= total_docs {
+            total_docs
+        } else {
+            limit.saturating_mul(12).max(200).min(total_docs)
+        };
 
-        let strict_query = self.build_query(&tokens, include_filename, true);
+        let strict_query = self.build_query(&parsed, include_filename, true);
         let mut raw_docs = searcher.search(&strict_query, &TopDocs::with_limit(candidate_limit))?;
 
-        let strict_count = raw_docs.len();
-        if strict_count < limit && tokens.len() > 1 {
-            let relaxed_query = self.build_query(&tokens, include_filename, false);
-            let extra_docs = searcher.search(&relaxed_query, &TopDocs::with_limit(candidate_limit))?;
-            // Dar mayor peso a resultados estrictos que cumplieron todos los términos
-            for (s, addr) in &mut raw_docs {
-                *s *= 2.5;
-                let _ = addr;
+        // Precisión estilo Kensaku: solo activar respaldo relajado si NO hubo ninguna coincidencia estricta
+        // y la consulta tiene 3+ palabras sin frases exactas entre comillas (evita falsos positivos en búsquedas de 2 términos).
+        if raw_docs.is_empty() && parsed.exact_phrases.is_empty() && parsed.positive_tokens.len() >= 3 {
+            let relaxed_query = self.build_query(&parsed, include_filename, false);
+            let mut extra_docs = searcher.search(&relaxed_query, &TopDocs::with_limit(candidate_limit))?;
+            for (s, _) in &mut extra_docs {
+                *s *= 0.25;
             }
             raw_docs.extend(extra_docs);
         }
@@ -161,6 +225,7 @@ impl DragonIndexEngine {
         let q_lower = trimmed.to_lowercase();
         let mut deduped: HashMap<String, SearchHit> = HashMap::new();
 
+        // Paso 1: deduplicar y puntuar 100% en memoria SIN syscalls de disco (0 `canonicalize` en esta fase)
         for (raw_score, doc_address) in raw_docs {
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
 
@@ -181,14 +246,10 @@ impl DragonIndexEngine {
                 continue;
             }
 
-            // Resolver ruta real en disco para descartar registros obsoletos/borrados y colapsar rutas relativas vs absolutas
-            let Some(resolved_path) = resolve_existing_file_path(&raw_path) else {
-                continue;
-            };
             let dedup_key = if cfg!(windows) {
-                resolved_path.to_lowercase()
+                raw_path.to_lowercase()
             } else {
-                resolved_path.clone()
+                raw_path.clone()
             };
 
             let mut score = raw_score;
@@ -200,11 +261,11 @@ impl DragonIndexEngine {
                     score *= 1.5;
                 }
             }
-            if is_noisy_build_or_cache_path(&resolved_path) {
+            if is_noisy_build_or_cache_path(&raw_path) {
                 score *= 0.02;
             }
 
-            let resolved_name = Path::new(&resolved_path)
+            let resolved_name = Path::new(&raw_path)
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .filter(|n| !n.is_empty())
@@ -219,7 +280,7 @@ impl DragonIndexEngine {
                 })
                 .or_insert_with(|| SearchHit {
                     id,
-                    path: resolved_path,
+                    path: raw_path,
                     filename: resolved_name,
                     size,
                     score,
@@ -227,90 +288,103 @@ impl DragonIndexEngine {
                 });
         }
 
-        let mut hits: Vec<SearchHit> = deduped.into_values().collect();
-        hits.sort_by(|a, b| {
+        // Paso 2: ordenar por relevancia y validar existencia en disco SOLO hasta completar `limit`
+        let mut candidates: Vec<SearchHit> = deduped.into_values().collect();
+        candidates.sort_by(|a, b| {
             let a_noisy = is_noisy_build_or_cache_path(&a.path);
             let b_noisy = is_noisy_build_or_cache_path(&b.path);
             a_noisy
                 .cmp(&b_noisy)
                 .then_with(|| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal))
         });
-        hits.truncate(limit);
+
+        let mut hits: Vec<SearchHit> = Vec::with_capacity(limit.min(candidates.len()));
+        for hit in candidates {
+            if fast_file_exists(&hit.path) {
+                hits.push(hit);
+                if hits.len() >= limit {
+                    break;
+                }
+            }
+        }
         Ok(hits)
     }
 
-    fn build_query(&self, tokens: &[String], include_filename: bool, require_all: bool) -> Box<dyn Query> {
+    fn build_query(
+        &self,
+        parsed: &ParsedContentQuery,
+        include_filename: bool,
+        require_all: bool,
+    ) -> Box<dyn Query> {
         let mut outer_clauses: Vec<(Occur, Box<dyn Query>)> = Vec::new();
         let token_occur = if require_all { Occur::Must } else { Occur::Should };
 
-        for tok in tokens {
+        // 1. Frases exactas entre comillas ("orden del dia") -> Occur::Must con PhraseQuery
+        for phrase in &parsed.exact_phrases {
+            if phrase.len() == 1 {
+                let mut per_tok = Vec::new();
+                self.push_token_clauses(&mut per_tok, &phrase[0], include_filename);
+                outer_clauses.push((Occur::Must, Box::new(BooleanQuery::new(per_tok))));
+            } else if phrase.len() >= 2 {
+                let phrase_terms: Vec<tantivy::Term> = phrase
+                    .iter()
+                    .map(|t| tantivy::Term::from_field_text(self.field_content, t))
+                    .collect();
+                let mut pq = PhraseQuery::new(phrase_terms);
+                pq.set_slop(0);
+                let mut phrase_alts: Vec<(Occur, Box<dyn Query>)> = vec![(
+                    Occur::Should,
+                    Box::new(BoostQuery::new(Box::new(pq), 4.5)),
+                )];
+                // También tolerar versión sin tildes si difiere
+                let folded_terms: Vec<String> = phrase.iter().map(|t| fold_accents(t)).collect();
+                if folded_terms != *phrase {
+                    let ft: Vec<tantivy::Term> = folded_terms
+                        .iter()
+                        .map(|t| tantivy::Term::from_field_text(self.field_content, t))
+                        .collect();
+                    let mut fpq = PhraseQuery::new(ft);
+                    fpq.set_slop(0);
+                    phrase_alts.push((Occur::Should, Box::new(BoostQuery::new(Box::new(fpq), 4.0))));
+                }
+                outer_clauses.push((Occur::Must, Box::new(BooleanQuery::new(phrase_alts))));
+            }
+        }
+
+        // 2. Términos positivos (tolerantes a acentos y prefijo)
+        for tok in &parsed.positive_tokens {
             let mut per_token: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-            let folded = fold_accents(tok);
-            let char_len = tok.chars().count();
-
-            // Coincidencia exacta en contenido (máximo peso)
-            let content_term = tantivy::Term::from_field_text(self.field_content, tok);
-            per_token.push((
-                Occur::Should,
-                Box::new(BoostQuery::new(
-                    Box::new(TermQuery::new(content_term, IndexRecordOption::WithFreqsAndPositions)),
-                    3.0,
-                )),
-            ));
-
-            if folded != *tok {
-                let folded_term = tantivy::Term::from_field_text(self.field_content, &folded);
-                per_token.push((
-                    Occur::Should,
-                    Box::new(BoostQuery::new(
-                        Box::new(TermQuery::new(folded_term, IndexRecordOption::WithFreqsAndPositions)),
-                        2.7,
-                    )),
-                ));
-            }
-
-            // Expansión tolerante a acentos y prefijo en contenido (ej. "informacion" -> "información", "contrat" -> "contratos")
-            let allow_prefix = char_len >= 3;
-            if allow_prefix || has_foldable_latin_char(&folded) {
-                let pattern = build_accent_regex_pattern(&folded, allow_prefix);
-                if let Ok(rx) = RegexQuery::from_pattern(&pattern, self.field_content) {
-                    per_token.push((Occur::Should, Box::new(BoostQuery::new(Box::new(rx), 2.5))));
-                }
-            }
-
-            if include_filename {
-                let fn_term = tantivy::Term::from_field_text(self.field_filename, tok);
-                per_token.push((
-                    Occur::Should,
-                    Box::new(BoostQuery::new(
-                        Box::new(TermQuery::new(fn_term, IndexRecordOption::WithFreqsAndPositions)),
-                        1.8,
-                    )),
-                ));
-                if folded != *tok {
-                    let fn_folded = tantivy::Term::from_field_text(self.field_filename, &folded);
-                    per_token.push((
-                        Occur::Should,
-                        Box::new(BoostQuery::new(
-                            Box::new(TermQuery::new(fn_folded, IndexRecordOption::WithFreqsAndPositions)),
-                            1.6,
-                        )),
-                    ));
-                }
-                if allow_prefix || has_foldable_latin_char(&folded) {
-                    let pattern = build_accent_regex_pattern(&folded, allow_prefix);
-                    if let Ok(rx) = RegexQuery::from_pattern(&pattern, self.field_filename) {
-                        per_token.push((Occur::Should, Box::new(BoostQuery::new(Box::new(rx), 1.2))));
-                    }
-                }
-            }
-
+            self.push_token_clauses(&mut per_token, tok, include_filename);
             outer_clauses.push((token_occur, Box::new(BooleanQuery::new(per_token))));
         }
 
-        // Boost adicional cuando los términos aparecen como frase cercana dentro del documento
-        if tokens.len() >= 2 {
-            let phrase_terms: Vec<tantivy::Term> = tokens
+        // 3. Exclusiones explícitas (!termino / -termino) -> Occur::MustNot
+        for ex in &parsed.excluded_tokens {
+            let folded = fold_accents(ex);
+            let t1 = tantivy::Term::from_field_text(self.field_content, ex);
+            outer_clauses.push((
+                Occur::MustNot,
+                Box::new(TermQuery::new(t1, IndexRecordOption::Basic)),
+            ));
+            if folded != *ex {
+                let t2 = tantivy::Term::from_field_text(self.field_content, &folded);
+                outer_clauses.push((
+                    Occur::MustNot,
+                    Box::new(TermQuery::new(t2, IndexRecordOption::Basic)),
+                ));
+            }
+            if has_foldable_latin_char(&folded) {
+                let pat = build_accent_regex_pattern(&folded, false);
+                if let Ok(rx) = RegexQuery::from_pattern(&pat, self.field_content) {
+                    outer_clauses.push((Occur::MustNot, Box::new(rx)));
+                }
+            }
+        }
+
+        // 4. Boost adicional cuando múltiples términos aparecen como frase cercana dentro del documento
+        if parsed.positive_tokens.len() >= 2 {
+            let phrase_terms: Vec<tantivy::Term> = parsed
+                .positive_tokens
                 .iter()
                 .map(|t| tantivy::Term::from_field_text(self.field_content, t))
                 .collect();
@@ -321,6 +395,159 @@ impl DragonIndexEngine {
 
         Box::new(BooleanQuery::new(outer_clauses))
     }
+
+    fn push_token_clauses(
+        &self,
+        per_token: &mut Vec<(Occur, Box<dyn Query>)>,
+        tok: &str,
+        include_filename: bool,
+    ) {
+        let folded = fold_accents(tok);
+        let char_len = tok.chars().count();
+
+        // Coincidencia exacta en contenido (máximo peso)
+        let content_term = tantivy::Term::from_field_text(self.field_content, tok);
+        per_token.push((
+            Occur::Should,
+            Box::new(BoostQuery::new(
+                Box::new(TermQuery::new(content_term, IndexRecordOption::WithFreqsAndPositions)),
+                3.0,
+            )),
+        ));
+
+        if folded != *tok {
+            let folded_term = tantivy::Term::from_field_text(self.field_content, &folded);
+            per_token.push((
+                Occur::Should,
+                Box::new(BoostQuery::new(
+                    Box::new(TermQuery::new(folded_term, IndexRecordOption::WithFreqsAndPositions)),
+                    2.7,
+                )),
+            ));
+        }
+
+        // Expansión tolerante a acentos y prefijo en contenido
+        let allow_prefix = char_len >= 3;
+        if allow_prefix || has_foldable_latin_char(&folded) {
+            let pattern = build_accent_regex_pattern(&folded, allow_prefix);
+            if let Ok(rx) = RegexQuery::from_pattern(&pattern, self.field_content) {
+                per_token.push((Occur::Should, Box::new(BoostQuery::new(Box::new(rx), 2.5))));
+            }
+        }
+
+        if include_filename {
+            let fn_term = tantivy::Term::from_field_text(self.field_filename, tok);
+            per_token.push((
+                Occur::Should,
+                Box::new(BoostQuery::new(
+                    Box::new(TermQuery::new(fn_term, IndexRecordOption::WithFreqsAndPositions)),
+                    1.8,
+                )),
+            ));
+            if folded != *tok {
+                let fn_folded = tantivy::Term::from_field_text(self.field_filename, &folded);
+                per_token.push((
+                    Occur::Should,
+                    Box::new(BoostQuery::new(
+                        Box::new(TermQuery::new(fn_folded, IndexRecordOption::WithFreqsAndPositions)),
+                        1.6,
+                    )),
+                ));
+            }
+            if allow_prefix || has_foldable_latin_char(&folded) {
+                let pattern = build_accent_regex_pattern(&folded, allow_prefix);
+                if let Ok(rx) = RegexQuery::from_pattern(&pattern, self.field_filename) {
+                    per_token.push((Occur::Should, Box::new(BoostQuery::new(Box::new(rx), 1.2))));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParsedContentQuery {
+    positive_tokens: Vec<String>,
+    exact_phrases: Vec<Vec<String>>,
+    excluded_tokens: Vec<String>,
+}
+
+impl ParsedContentQuery {
+    fn is_empty(&self) -> bool {
+        self.positive_tokens.is_empty() && self.exact_phrases.is_empty()
+    }
+}
+
+fn parse_content_query(query: &str) -> ParsedContentQuery {
+    let mut parsed = ParsedContentQuery::default();
+    let mut chars = query.chars().peekable();
+
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() || ch == '|' {
+            chars.next();
+            continue;
+        }
+        if ch == '"' {
+            chars.next();
+            let mut phrase_raw = String::new();
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    break;
+                }
+                phrase_raw.push(c);
+            }
+            let toks = extract_query_tokens(&phrase_raw);
+            if !toks.is_empty() {
+                parsed.exact_phrases.push(toks);
+            }
+            continue;
+        }
+        let mut word = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_whitespace() || c == '"' || c == '|' {
+                break;
+            }
+            word.push(c);
+            chars.next();
+        }
+        let lower = word.to_ascii_lowercase();
+        // Omitir modificadores exclusivos de ruta (path:, folder:, d:\...) en búsqueda de contenido
+        if lower.starts_with("path:")
+            || lower.starts_with("ruta:")
+            || lower.starts_with("folder:")
+            || lower.starts_with("carpeta:")
+            || (word.len() >= 2 && word.as_bytes()[0].is_ascii_alphabetic() && word.as_bytes()[1] == b':')
+        {
+            continue;
+        }
+        if let Some(rest) = word.strip_prefix('!').or_else(|| word.strip_prefix('-')) {
+            if !rest.is_empty() {
+                for tok in extract_query_tokens(rest) {
+                    parsed.excluded_tokens.push(tok);
+                }
+                continue;
+            }
+        }
+        for tok in extract_query_tokens(&word) {
+            parsed.positive_tokens.push(tok);
+        }
+    }
+    parsed
+}
+
+fn fast_file_exists(raw_path: &str) -> bool {
+    let p = Path::new(raw_path);
+    if p.is_file() {
+        return true;
+    }
+    if cfg!(windows) && raw_path.len() >= 248 && !raw_path.starts_with(r"\\?\") {
+        let extended = if let Some(unc) = raw_path.strip_prefix(r"\\") {
+            PathBuf::from(format!(r"\\?\UNC\{}", unc))
+        } else {
+            PathBuf::from(format!(r"\\?\{}", raw_path))
+        };
+        return extended.is_file();
+    }
+    false
 }
 
 fn extract_query_tokens(query: &str) -> Vec<String> {
@@ -389,25 +616,52 @@ fn build_accent_regex_pattern(folded_tok: &str, allow_prefix: bool) -> String {
     pat
 }
 
-fn resolve_existing_file_path(raw_path: &str) -> Option<String> {
-    let p = Path::new(raw_path);
-    if !p.is_file() {
-        return None;
+fn clear_readonly_flags_in_dir(dir: &Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                if let Ok(meta) = std::fs::metadata(&p) {
+                    let mut perms = meta.permissions();
+                    if perms.readonly() {
+                        perms.set_readonly(false);
+                        let _ = std::fs::set_permissions(&p, perms);
+                    }
+                }
+            }
+        }
     }
-    let abs: PathBuf = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let s = abs.to_string_lossy();
-    if let Some(stripped) = s.strip_prefix(r"\\?\UNC\") {
-        Some(format!(r"\\{}", stripped))
-    } else if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        Some(stripped.to_string())
-    } else {
-        Some(s.into_owned())
+}
+
+fn is_transient_windows_io_error(err: &TantivyError) -> bool {
+    match err {
+        TantivyError::IoError(io_err) => {
+            if io_err.kind() == std::io::ErrorKind::PermissionDenied {
+                return true;
+            }
+            matches!(io_err.raw_os_error(), Some(5) | Some(32) | Some(33))
+        }
+        _ => {
+            let msg = err.to_string().to_ascii_lowercase();
+            msg.contains("os error 5")
+                || msg.contains("os error 32")
+                || msg.contains("os error 33")
+                || msg.contains("acceso denegado")
+                || msg.contains("access is denied")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_windows_io_error_detects_access_denied() {
+        let io_err = std::io::Error::from_raw_os_error(5);
+        let tantivy_err = TantivyError::from(io_err);
+        assert!(is_transient_windows_io_error(&tantivy_err));
+    }
 
     #[test]
     fn content_search_handles_accents_prefixes_dedup_and_noise() {
@@ -452,6 +706,21 @@ mod tests {
         // 2. search_content no debe devolver coincidencias exclusivas del nombre ("acta")
         let name_only = engine.search_content("acta", 10).unwrap();
         assert!(name_only.is_empty());
+
+        // 3. Exclusión estilo Kensaku/Everything (-arrendamiento / !arrendamiento)
+        let excluded = engine.search_content("informacion !arrendamiento", 10).unwrap();
+        assert!(
+            excluded.iter().all(|h| Path::new(&h.path).file_name().unwrap() != "acta.txt"),
+            "acta.txt debió excluirse con !arrendamiento"
+        );
+
+        // 4. Frase exacta entre comillas ("contratos de arrendamiento")
+        let exact = engine.search_content("\"contratos de arrendamiento\"", 10).unwrap();
+        assert!(exact.iter().any(|h| Path::new(&h.path).file_name().unwrap() == "acta.txt"));
+
+        // 5. Precisión estricta de 2 palabras: no devolver falsos positivos si falta una palabra
+        let strict_miss = engine.search_content("informacion inexistente999", 10).unwrap();
+        assert!(strict_miss.is_empty());
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }

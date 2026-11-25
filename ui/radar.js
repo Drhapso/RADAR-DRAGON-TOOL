@@ -16,10 +16,23 @@ const radarTopBtn = document.getElementById('radarTopBtn');
 const sweepStatusEl = document.getElementById('sweepStatus');
 const lanAgentBanner = document.getElementById('lanAgentBanner');
 const lanAgentDownloadBtn = document.getElementById('lanAgentDownloadBtn');
+const sharedServerBanner = document.getElementById('sharedServerBanner');
+const sharedServerBannerText = document.getElementById('sharedServerBannerText');
+const shortcutDblClickLabel = document.getElementById('shortcutDblClickLabel');
+const shortcutEnterLabel = document.getElementById('shortcutEnterLabel');
 const libreofficeNoticeBanner = document.getElementById('libreofficeNoticeBanner');
 const libreofficeNoticeCloseBtn = document.getElementById('libreofficeNoticeCloseBtn');
+const indexLiveBar = document.getElementById('indexLiveBar');
+const indexLiveText = document.getElementById('indexLiveText');
+const indexLivePct = document.getElementById('indexLivePct');
+const indexProgressFill = document.getElementById('indexProgressFill');
+const indexDrivesList = document.getElementById('indexDrivesList');
 const extensionChipsBar = document.getElementById('extensionChipsBar');
 const extensionChipsList = document.getElementById('extensionChipsList');
+const resultsToolbar = document.getElementById('resultsToolbar');
+const resultsCountLabel = document.getElementById('resultsCountLabel');
+const expandResultsBtn = document.getElementById('expandResultsBtn');
+const resultsQuickFilter = document.getElementById('resultsQuickFilter');
 
 // Elementos del panel integrado de Vista Previa
 const previewBadge = document.getElementById('previewBadge');
@@ -30,16 +43,74 @@ const previewOpenLocationBtn = document.getElementById('previewOpenLocationBtn')
 const previewCopyBtn = document.getElementById('previewCopyBtn');
 const previewExpandBtn = document.getElementById('previewExpandBtn');
 
-// Resolución de motor local:
-// Si la interfaz web se abre desde otro servidor de la red LAN, consulta el motor local del propio equipo (127.0.0.1)
-// para buscar e indexar exclusivamente los archivos locales de este equipo y nunca los del servidor.
+// Resolución híbrida LAN / Local:
+// - Modo "local_agent" (predeterminado): si se abre desde otro PC en la LAN, consulta el motor local
+//   del propio equipo (127.0.0.1) para indexar y buscar exclusivamente sus propios discos.
+// - Modo "shared_server" (config/site_config.json): consulta directamente el repositorio de carpetas
+//   compartidas en el servidor sin instalar nada en los equipos cliente.
 const isLocalOrigin = ['127.0.0.1', 'localhost', '::1', ''].includes(window.location.hostname);
-const LOCAL_AGENT_BASE = `http://127.0.0.1:${window.location.port || '8088'}`;
-let apiBase = isLocalOrigin ? '' : LOCAL_AGENT_BASE;
+let serverPort = window.location.port || '8092';
+let apiBase = isLocalOrigin ? '' : `http://127.0.0.1:${serverPort}`;
 let localAgentOnline = isLocalOrigin;
+let isSharedServerMode = false;
+let remoteSharedMode = false;
 
 if (lanAgentDownloadBtn && !isLocalOrigin) {
     lanAgentDownloadBtn.href = `${window.location.origin}/api/agent/launcher`;
+}
+
+function applyActionLabelsForMode() {
+    if (remoteSharedMode) {
+        if (previewOpenLocationBtn) {
+            previewOpenLocationBtn.textContent = '⬇ Descargar';
+            previewOpenLocationBtn.title = 'Descargar archivo desde el servidor LAN (Doble clic / Enter)';
+        }
+        if (modalOpenLocationBtn) {
+            modalOpenLocationBtn.textContent = '⬇ Descargar';
+            modalOpenLocationBtn.title = 'Descargar archivo desde el servidor LAN';
+        }
+        if (shortcutDblClickLabel) shortcutDblClickLabel.textContent = 'DESCARGAR';
+        if (shortcutEnterLabel) shortcutEnterLabel.textContent = 'DESCARGAR';
+        if (previewMeta && !activePreviewItem) {
+            previewMeta.textContent = '1 click para previsualizar · 2 clicks para descargar archivo';
+        }
+    }
+}
+
+async function detectServerMode() {
+    if (window.location.protocol === 'file:') return;
+    try {
+        const res = await fetch('/api/server-info');
+        if (!res.ok) return;
+        const info = await res.json();
+        if (info.port) {
+            serverPort = String(info.port);
+        }
+        if (info.shared_server_active) {
+            isSharedServerMode = true;
+            remoteSharedMode = !isLocalOrigin;
+            apiBase = '';
+            localAgentOnline = true;
+            if (lanAgentBanner) lanAgentBanner.hidden = true;
+            if (sharedServerBanner && sharedServerBannerText) {
+                const count = Number(info.shared_paths_count || 0);
+                const hostLabel = escapeHtml(info.machine_name || window.location.hostname || 'SERVIDOR');
+                if (count === 0) {
+                    sharedServerBanner.classList.add('warn');
+                    sharedServerBannerText.innerHTML = `<strong>Modo LAN Compartido (${hostLabel}):</strong> No hay carpetas en <code>shared_paths</code> dentro de <code>config\\site_config.json</code>. Agrega las carpetas a compartir y reinicia el radar.`;
+                } else {
+                    sharedServerBanner.classList.remove('warn');
+                    sharedServerBannerText.innerHTML = `<strong>Modo LAN Compartido (${hostLabel}):</strong> Buscando en <b>${count}</b> carpeta(s) compartida(s) del servidor.${remoteSharedMode ? ' Doble clic o <b>Descargar</b> para guardar una copia.' : ''}`;
+                }
+                sharedServerBanner.hidden = false;
+            }
+            applyActionLabelsForMode();
+        } else if (!isLocalOrigin) {
+            isSharedServerMode = false;
+            remoteSharedMode = false;
+            apiBase = `http://127.0.0.1:${serverPort}`;
+        }
+    } catch (_) {}
 }
 
 // Estado del Radar Anime
@@ -49,8 +120,16 @@ let pingActive = false;
 let zoomLevel = 1; // 1 = cuadrícula clásica 8x8, 2 = zoom 12x12, 3 = zoom 5x5
 let radarBlips = [];
 let selectedIndex = -1;
+let allLoadedResults = [];
 let currentResults = [];
 let currentMode = 'all';
+const INITIAL_SEARCH_LIMIT = 50;
+const RENDER_CHUNK_SIZE = 150;
+let renderedCount = 0;
+let resultsExpanded = false;
+let resultsExpanding = false;
+let lastSearchQuery = '';
+let searchRequestSeq = 0;
 let activePreviewItem = null;
 let activePreviewData = null;
 let previewRequestSeq = 0;
@@ -86,7 +165,7 @@ function updateSearchPlaceholder() {
     if (currentMode === 'extension') {
         searchInput.placeholder = 'ESCRIBE UNA EXTENSIÓN (EJ: PDF, .XLSX, *.PPTX O PDF CONTRATO)...';
     } else {
-        searchInput.placeholder = 'BUSCAR ARCHIVOS, TEXTO O EXTENSIÓN (EJ: .PDF, *.XLSX, EXT:DOCX)...';
+        searchInput.placeholder = 'BUSCAR ARCHIVOS O CONTENIDO (EJ: .PDF, "FRASE EXACTA", ACTA*2026, !COPIA, A | B, D:\\2025)...';
     }
 }
 
@@ -134,42 +213,121 @@ async function refreshExtensionChips(query = '') {
     } catch (_) {}
 }
 
+let indexEventSource = null;
+let wasRecoveringDb = false;
+
+function renderDriveChips(drives) {
+    if (!indexDrivesList) return;
+    if (!Array.isArray(drives) || drives.length === 0) {
+        indexDrivesList.innerHTML = '';
+        return;
+    }
+    indexDrivesList.innerHTML = drives.map(d => {
+        const st = String(d.status || 'PENDING').toUpperCase();
+        const cls = st === 'OK' ? 'ok' : st === 'INDEXING' ? 'indexing' : st === 'MISSING' ? 'missing' : 'pending';
+        const icon = st === 'OK' ? '✓' : st === 'INDEXING' ? '⟳' : st === 'MISSING' ? '!' : '…';
+        const files = Number(d.indexed_files || 0).toLocaleString();
+        const targetsInfo = Number(d.targets_total || 0) > 0
+            ? ` (${d.targets_completed || 0}/${d.targets_total})`
+            : '';
+        return `<span class="drive-chip ${cls}" title="Unidad ${escapeHtml(d.drive)} · Estado: ${escapeHtml(st)}">${escapeHtml(d.drive)} ${icon} ${escapeHtml(files)}${escapeHtml(targetsInfo)}</span>`;
+    }).join('');
+}
+
+function applyHudStatusData(data) {
+    if (!data) return;
+    localAgentOnline = true;
+    if (lanAgentBanner) lanAgentBanner.hidden = true;
+    if (libreofficeNoticeBanner) {
+        const loInstalled = data.libreoffice_installed !== false;
+        libreofficeNoticeBanner.hidden = loInstalled || libreofficeNoticeDismissed;
+    }
+
+    const dbStats = document.getElementById('dbStats');
+    const statusInd = document.getElementById('statusIndicator');
+    const machineLabel = data.machine_name ? `${data.machine_name} | ` : '';
+    const editionTag = data.portable_edition
+        ? 'PORTABLE'
+        : data.shared_server_active
+            ? 'LAN COMPARTIDO ACTIVO'
+            : 'RADAR LOCAL ACTIVO';
+
+    if (dbStats) {
+        dbStats.textContent = `${machineLabel}ARCHIVOS: ${Number(data.redb_records || 0).toLocaleString()} | CONTENIDO: ${Number(data.vector_count || 0).toLocaleString()}`;
+    }
+
+    const isIndexing = data.phase && data.phase !== 'READY';
+    const pctRaw = typeof data.percent === 'number'
+        ? data.percent
+        : (data.total_targets > 0 ? (data.target_index / data.total_targets) * 100 : (isIndexing ? 0 : 100));
+    const pct = Math.max(0, Math.min(100, pctRaw));
+
+    if (statusInd) {
+        if (data.phase === 'RECOVERING_DB') {
+            statusInd.innerHTML = `<span class="blink-dot"></span> RECUPERANDO BASE DE DATOS...`;
+        } else if (data.phase === 'ERROR') {
+            statusInd.innerHTML = `<span class="blink-dot"></span> ERROR DE BASE DE DATOS`;
+        } else if (data.phase === 'INITIAL_INDEXING') {
+            statusInd.innerHTML = `<span class="blink-dot"></span> INDEXANDO [${data.target_index}/${data.total_targets} · ${pct.toFixed(0)}%]`;
+        } else if (data.phase === 'RESUMING_CHECKPOINT') {
+            statusInd.innerHTML = `<span class="blink-dot"></span> REANUDANDO [${data.target_index}/${data.total_targets} · ${pct.toFixed(0)}%]`;
+        } else if (data.phase === 'VALIDATING_INDEX') {
+            statusInd.innerHTML = `<span class="blink-dot"></span> VALIDANDO EQUIPO [${data.target_index}/${data.total_targets}]`;
+        } else {
+            statusInd.innerHTML = `<span class="blink-dot"></span> ${editionTag}`;
+        }
+    }
+
+    if (data.phase === 'RECOVERING_DB') {
+        wasRecoveringDb = true;
+    } else if (wasRecoveringDb && data.phase !== 'ERROR') {
+        wasRecoveringDb = false;
+        if (searchInput && searchInput.value.trim()) {
+            performSearch(searchInput.value);
+        }
+    }
+
+    if (indexLiveBar) {
+        const drives = Array.isArray(data.drives) ? data.drives : [];
+        const hasMissingDrive = drives.some(d => d.status === 'MISSING');
+        const showBar = isIndexing || hasMissingDrive;
+        indexLiveBar.hidden = !showBar;
+        if (showBar) {
+            if (indexLivePct) indexLivePct.textContent = data.phase === 'RECOVERING_DB' ? 'DB...' : `${pct.toFixed(1)}%`;
+            if (indexProgressFill) indexProgressFill.style.width = data.phase === 'RECOVERING_DB' ? '15%' : `${pct.toFixed(1)}%`;
+            if (indexLiveText) {
+                if (data.phase === 'RECOVERING_DB') {
+                    indexLiveText.textContent = `${data.current_file || 'Abriendo/recuperando radar.redb...'} · La búsqueda se activará automáticamente al terminar`;
+                } else if (data.phase === 'ERROR') {
+                    indexLiveText.textContent = `ERROR: ${data.current_target || data.last_checkpoint || 'No se pudo abrir la base de datos'}`;
+                } else {
+                    const targetStr = data.current_target ? ` · ${data.current_target}` : '';
+                    const subProgress = Number(data.target_total || 0) > 0
+                        ? ` (${Number(data.target_processed || 0).toLocaleString()}/${Number(data.target_total).toLocaleString()})`
+                        : '';
+                    const fileStr = data.current_file ? ` · ${data.current_file}` : '';
+                    indexLiveText.textContent = isIndexing
+                        ? `[${data.target_index}/${data.total_targets}]${targetStr}${subProgress}${fileStr}`
+                        : `ATENCIÓN: Unidad sin indexar detectada · Revalidando...`;
+                }
+            }
+            renderDriveChips(drives);
+        }
+    }
+}
+
 // Cargar estado real de Dragon Radar desde el motor del equipo local
 async function updateHudStatus() {
     try {
         const res = await fetch(`${apiBase}/api/status`);
         if (res.ok) {
             const data = await res.json();
-            localAgentOnline = true;
-            if (lanAgentBanner) lanAgentBanner.hidden = true;
-            if (libreofficeNoticeBanner) {
-                const loInstalled = data.libreoffice_installed !== false;
-                libreofficeNoticeBanner.hidden = loInstalled || libreofficeNoticeDismissed;
-            }
-
-            const dbStats = document.getElementById('dbStats');
-            const statusInd = document.getElementById('statusIndicator');
-            const machineLabel = data.machine_name ? `${data.machine_name} | ` : '';
-            const editionTag = data.portable_edition ? 'PORTABLE' : 'RADAR LOCAL ACTIVO';
-            if (dbStats) {
-                dbStats.textContent = `${machineLabel}ARCHIVOS: ${data.redb_records.toLocaleString()} | CONTENIDO: ${data.vector_count}`;
-            }
-            if (statusInd) {
-                if (data.phase === 'INITIAL_INDEXING') {
-                    statusInd.innerHTML = `<span class="blink-dot"></span> INDEXANDO [${data.target_index}/${data.total_targets}] (+${data.new_files})`;
-                } else if (data.phase === 'RESUMING_CHECKPOINT') {
-                    statusInd.innerHTML = `<span class="blink-dot"></span> REANUDANDO PUNTO DE CONTROL [${data.target_index}/${data.total_targets}]`;
-                } else if (data.phase === 'VALIDATING_INDEX') {
-                    statusInd.innerHTML = `<span class="blink-dot"></span> VALIDANDO EQUIPO [${data.target_index}/${data.total_targets}]`;
-                } else {
-                    statusInd.innerHTML = `<span class="blink-dot"></span> ${editionTag}`;
-                }
-            }
+            applyHudStatusData(data);
             return;
         }
     } catch (_) {}
 
-    if (!isLocalOrigin) {
+    if (!isLocalOrigin && !isSharedServerMode) {
         localAgentOnline = false;
         if (lanAgentBanner) lanAgentBanner.hidden = false;
         const statusInd = document.getElementById('statusIndicator');
@@ -178,8 +336,58 @@ async function updateHudStatus() {
         }
     }
 }
-updateHudStatus();
-setInterval(updateHudStatus, 2000);
+
+// Stream SSE en tiempo real (500ms mientras indexa, 2.5s en reposo) con reconexión automática
+function startIndexStream() {
+    if (window.location.protocol === 'file:' || typeof EventSource === 'undefined') return;
+    if (indexEventSource) {
+        try { indexEventSource.close(); } catch (_) {}
+        indexEventSource = null;
+    }
+    try {
+        const es = new EventSource(`${apiBase}/api/index/stream`);
+        indexEventSource = es;
+        es.onmessage = (ev) => {
+            try {
+                const data = JSON.parse(ev.data);
+                applyHudStatusData(data);
+            } catch (_) {}
+        };
+        es.onerror = () => {
+            try { es.close(); } catch (_) {}
+            indexEventSource = null;
+            setTimeout(startIndexStream, 4000);
+        };
+    } catch (_) {}
+}
+
+// Regla al abrir la plataforma: validar si la indexación está completa o falta alguna parte.
+// Si está completa cierra ventanas de comandos auxiliares; si falta alguna parte continúa en segundo plano.
+async function validateIndexOnOpen() {
+    if (window.location.protocol === 'file:') return;
+    try {
+        if (!isLocalOrigin && apiBase !== '') {
+            fetch('/api/index/validate').catch(() => {});
+        }
+        const res = await fetch(`${apiBase}/api/index/validate`);
+        if (res.ok) {
+            const v = await res.json();
+            const statusInd = document.getElementById('statusIndicator');
+            if (statusInd && v && v.complete === false) {
+                const pending = Number(v.pending_targets || 0);
+                statusInd.innerHTML = `<span class="blink-dot"></span> INDEXANDO EN SEGUNDO PLANO${pending > 0 ? ` (${pending} PEND.)` : ''}`;
+            }
+        }
+    } catch (_) {}
+}
+
+detectServerMode().finally(() => {
+    validateIndexOnOpen();
+    updateHudStatus();
+    startIndexStream();
+    performSearch(searchInput ? searchInput.value : '');
+});
+setInterval(updateHudStatus, 3000);
 
 // Botón superior del Radar (estilo pulsador Toriyama: cambia zoom de cuadrícula y dispara ping)
 if (radarTopBtn) {
@@ -242,17 +450,111 @@ function generateBlipCoordinates(item, index) {
     };
 }
 
+function foldTextForFilter(str) {
+    return String(str || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase();
+}
+
+function updateResultsToolbar() {
+    if (!resultsToolbar || !resultsCountLabel || !expandResultsBtn) return;
+
+    const hasQuery = lastSearchQuery.length > 0;
+    const totalLoaded = allLoadedResults.length;
+    const visibleTotal = currentResults.length;
+    const filterActive = Boolean(resultsQuickFilter && resultsQuickFilter.value.trim().length > 0);
+
+    if (!hasQuery && totalLoaded === 0) {
+        resultsToolbar.hidden = true;
+        return;
+    }
+
+    resultsToolbar.hidden = false;
+
+    if (resultsExpanding) {
+        resultsCountLabel.textContent = 'Buscando absolutamente todas las coincidencias sin límite...';
+        expandResultsBtn.disabled = true;
+        expandResultsBtn.textContent = '⏳ CARGANDO TODAS...';
+        expandResultsBtn.classList.remove('expanded');
+    } else if (resultsExpanded) {
+        if (filterActive) {
+            resultsCountLabel.textContent = `Filtro local: ${visibleTotal.toLocaleString()} de ${totalLoaded.toLocaleString()} coincidencias totales`;
+        } else {
+            resultsCountLabel.textContent = `Todas las coincidencias: ${totalLoaded.toLocaleString()} (sin límite)`;
+        }
+        expandResultsBtn.disabled = false;
+        expandResultsBtn.textContent = `⊟ CONTRAER (TOP ${INITIAL_SEARCH_LIMIT})`;
+        expandResultsBtn.title = `Volver a la vista compacta de las primeras ${INITIAL_SEARCH_LIMIT} coincidencias`;
+        expandResultsBtn.classList.add('expanded');
+    } else {
+        const cappedHint = totalLoaded >= INITIAL_SEARCH_LIMIT ? ` (límite inicial)` : '';
+        resultsCountLabel.textContent = `Mostrando ${totalLoaded.toLocaleString()} coincidencia${totalLoaded === 1 ? '' : 's'}${cappedHint}`;
+        expandResultsBtn.disabled = !hasQuery || totalLoaded === 0;
+        expandResultsBtn.textContent = '⊞ EXPANDIR RESULTADOS';
+        expandResultsBtn.title = 'Mostrar absolutamente todas las coincidencias encontradas sin límite';
+        expandResultsBtn.classList.remove('expanded');
+    }
+
+    if (resultsQuickFilter) {
+        const showFilter = resultsExpanded && totalLoaded > INITIAL_SEARCH_LIMIT;
+        resultsQuickFilter.hidden = !showFilter;
+        if (!showFilter && resultsQuickFilter.value) {
+            resultsQuickFilter.value = '';
+        }
+    }
+}
+
+function applyQuickFilterAndRender() {
+    const filterRaw = resultsQuickFilter ? resultsQuickFilter.value.trim() : '';
+    let filtered = allLoadedResults;
+    if (resultsExpanded && filterRaw) {
+        const tokens = foldTextForFilter(filterRaw).split(/\s+/).filter(Boolean);
+        filtered = allLoadedResults.filter(item => {
+            const haystack = foldTextForFilter(`${item.name || ''} ${item.path || ''} ${item.snippet || ''}`);
+            return tokens.every(tok => haystack.includes(tok));
+        });
+    }
+
+    currentResults = filtered;
+    // El lienzo del radar dibuja hasta 18 blips; evitar generar miles de objetos innecesarios
+    radarBlips = filtered.slice(0, 60).map((item, idx) => generateBlipCoordinates(item, idx));
+    blipCountEl.textContent = filtered.length.toLocaleString();
+    selectedIndex = filtered.length > 0 ? 0 : -1;
+
+    pingWaveRadius = 10;
+    pingActive = filtered.length > 0;
+
+    updateResultsToolbar();
+    renderResults(filtered);
+}
+
 let searchTimer = null;
-async function performSearch(query) {
-    const q = query.trim();
+async function performSearch(query, options = {}) {
+    const q = String(query || '').trim();
+    const expandAll = Boolean(options.expandAll);
+    const seq = ++searchRequestSeq;
+    lastSearchQuery = q;
+
+    if (!expandAll) {
+        resultsExpanded = false;
+        resultsExpanding = false;
+        if (resultsQuickFilter) {
+            resultsQuickFilter.value = '';
+        }
+    }
+
     let results = [];
     let usedApi = false;
 
-    if (!isLocalOrigin && !localAgentOnline) {
+    if (!isLocalOrigin && !isSharedServerMode && !localAgentOnline) {
+        allLoadedResults = [];
         currentResults = [];
         radarBlips = [];
+        renderedCount = 0;
         blipCountEl.textContent = '0';
         selectedIndex = -1;
+        if (resultsToolbar) resultsToolbar.hidden = true;
         resultsContainer.innerHTML = `
             <div class="empty-state">
                 <p class="empty-title">ACTIVA EL RADAR EN ESTE EQUIPO</p>
@@ -264,15 +566,20 @@ async function performSearch(query) {
 
     if (q) {
         try {
-            const res = await fetch(`${apiBase}/api/search?q=${encodeURIComponent(q)}&mode=${currentMode}&limit=25`);
+            const limitParam = expandAll ? 'all=true' : `limit=${INITIAL_SEARCH_LIMIT}`;
+            const res = await fetch(`${apiBase}/api/search?q=${encodeURIComponent(q)}&mode=${encodeURIComponent(currentMode)}&${limitParam}`);
+            if (seq !== searchRequestSeq) return;
             if (res.ok) {
                 const apiResults = await res.json();
+                if (seq !== searchRequestSeq) return;
                 if (Array.isArray(apiResults)) {
                     results = apiResults;
                     usedApi = true;
                 }
             }
-        } catch (_) {}
+        } catch (_) {
+            if (seq !== searchRequestSeq) return;
+        }
     }
 
     if (!usedApi && isLocalOrigin && window.location.protocol === 'file:' && (!q || results.length === 0)) {
@@ -295,15 +602,69 @@ async function performSearch(query) {
         }
     }
 
-    currentResults = results;
-    radarBlips = results.map((item, idx) => generateBlipCoordinates(item, idx));
-    blipCountEl.textContent = results.length;
-    selectedIndex = results.length > 0 ? 0 : -1;
+    if (seq !== searchRequestSeq) return;
+    resultsExpanded = expandAll;
+    resultsExpanding = false;
+    allLoadedResults = results;
+    applyQuickFilterAndRender();
+}
 
-    pingWaveRadius = 10;
-    pingActive = results.length > 0;
+/**
+ * Expande los resultados de la búsqueda actual solicitando al motor TODAS las coincidencias sin límite.
+ */
+async function expandAllSearchResults() {
+    if (resultsExpanding) return;
+    const q = searchInput ? searchInput.value.trim() : lastSearchQuery;
+    if (!q) return;
 
-    renderResults(results);
+    resultsExpanding = true;
+    updateResultsToolbar();
+    const footerExpandBtn = resultsContainer.querySelector('[data-action="expand-all"]');
+    if (footerExpandBtn) {
+        footerExpandBtn.disabled = true;
+        footerExpandBtn.textContent = '⏳ CARGANDO TODAS LAS COINCIDENCIAS...';
+    }
+
+    try {
+        await performSearch(q, { expandAll: true });
+    } finally {
+        resultsExpanding = false;
+        updateResultsToolbar();
+    }
+}
+
+/**
+ * Contrae la lista expandida volviendo al límite inicial rápido.
+ */
+async function collapseSearchResults() {
+    if (resultsExpanding) return;
+    const q = searchInput ? searchInput.value.trim() : lastSearchQuery;
+    await performSearch(q, { expandAll: false });
+}
+
+/**
+ * Alterna entre vista inicial (top N) y vista expandida (todas las coincidencias sin límite).
+ */
+function toggleExpandResults() {
+    if (resultsExpanded) {
+        collapseSearchResults();
+    } else {
+        expandAllSearchResults();
+    }
+}
+
+if (expandResultsBtn) {
+    expandResultsBtn.addEventListener('click', toggleExpandResults);
+}
+
+if (resultsQuickFilter) {
+    let filterTimer = null;
+    resultsQuickFilter.addEventListener('input', () => {
+        clearTimeout(filterTimer);
+        filterTimer = setTimeout(() => {
+            applyQuickFilterAndRender();
+        }, 90);
+    });
 }
 
 function getBadgeClass(badge) {
@@ -322,18 +683,8 @@ function escapeHtml(str) {
         .replace(/'/g, '&#39;');
 }
 
-function renderResults(results) {
-    if (results.length === 0) {
-        resultsContainer.innerHTML = `
-            <div class="empty-state">
-                <p class="empty-title">SIN SEÑAL EN EL RADAR</p>
-                <p class="empty-subtitle">No se detectaron archivos para esta consulta</p>
-            </div>
-        `;
-        return;
-    }
-
-    resultsContainer.innerHTML = results.map((item, idx) => `
+function buildResultRowHtml(item, idx) {
+    return `
         <div class="result-row ${idx === selectedIndex ? 'selected' : ''}" data-index="${idx}">
             <div class="result-badge ${getBadgeClass(item.badge)}">${escapeHtml(item.badge)}</div>
             <div class="result-details">
@@ -346,35 +697,141 @@ function renderResults(results) {
                 <div class="result-score-sub">N.${idx + 1} · ${escapeHtml(item.score)}</div>
             </div>
         </div>
-    `).join('');
-
-    document.querySelectorAll('.result-row').forEach(row => {
-        row.addEventListener('click', () => {
-            const idx = parseInt(row.dataset.index, 10);
-            selectResult(idx);
-            loadPreview(results[idx]);
-        });
-        row.addEventListener('dblclick', (e) => {
-            e.preventDefault();
-            const idx = parseInt(row.dataset.index, 10);
-            selectResult(idx);
-            openFileLocation(results[idx], row);
-        });
-    });
+    `;
 }
 
-function selectResult(index, shouldScroll = true) {
-    selectedIndex = index;
-    document.querySelectorAll('.result-row').forEach((row, idx) => {
-        if (idx === index) {
-            row.classList.add('selected');
-            if (shouldScroll) {
-                row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-            }
-        } else {
-            row.classList.remove('selected');
+function updateResultsFooterControl() {
+    const existing = resultsContainer.querySelector('.results-expand-footer');
+    if (existing) existing.remove();
+
+    const total = currentResults.length;
+    if (total === 0) return;
+
+    const footer = document.createElement('div');
+    footer.className = 'results-expand-footer';
+
+    if (renderedCount < total) {
+        const remaining = total - renderedCount;
+        const nextBatch = Math.min(RENDER_CHUNK_SIZE, remaining);
+        footer.innerHTML = `
+            <button type="button" class="results-chunk-btn" data-action="load-chunk">
+                ⬇ MOSTRAR +${nextBatch.toLocaleString()} MÁS (${renderedCount.toLocaleString()} / ${total.toLocaleString()})
+            </button>
+            <button type="button" class="results-chunk-btn" data-action="load-all-chunks">
+                ⚡ MOSTRAR TODOS LOS ${total.toLocaleString()} AHORA
+            </button>
+        `;
+        resultsContainer.appendChild(footer);
+    } else if (!resultsExpanded && lastSearchQuery && allLoadedResults.length >= INITIAL_SEARCH_LIMIT) {
+        footer.innerHTML = `
+            <button type="button" class="results-expand-footer-btn" data-action="expand-all">
+                ⊞ EXPANDIR RESULTADOS — VER TODAS LAS COINCIDENCIAS SIN LÍMITE
+            </button>
+        `;
+        resultsContainer.appendChild(footer);
+    }
+}
+
+function appendNextResultChunk(chunkSize = RENDER_CHUNK_SIZE) {
+    const total = currentResults.length;
+    if (renderedCount >= total) return;
+
+    const existingFooter = resultsContainer.querySelector('.results-expand-footer');
+    if (existingFooter) existingFooter.remove();
+
+    const end = Math.min(total, renderedCount + chunkSize);
+    let html = '';
+    for (let i = renderedCount; i < end; i++) {
+        html += buildResultRowHtml(currentResults[i], i);
+    }
+    resultsContainer.insertAdjacentHTML('beforeend', html);
+    renderedCount = end;
+    updateResultsFooterControl();
+}
+
+function ensureResultIndexRendered(targetIdx) {
+    if (targetIdx < renderedCount) return;
+    const needed = targetIdx - renderedCount + 25;
+    appendNextResultChunk(Math.max(RENDER_CHUNK_SIZE, needed));
+}
+
+function renderResults(results) {
+    renderedCount = 0;
+    resultsContainer.scrollTop = 0;
+
+    if (results.length === 0) {
+        resultsContainer.innerHTML = `
+            <div class="empty-state">
+                <p class="empty-title">SIN SEÑAL EN EL RADAR</p>
+                <p class="empty-subtitle">${lastSearchQuery ? 'No se detectaron archivos para esta consulta' : 'Escribe el nombre de un archivo o el texto dentro de tus documentos'}</p>
+            </div>
+        `;
+        return;
+    }
+
+    resultsContainer.innerHTML = '';
+    appendNextResultChunk(RENDER_CHUNK_SIZE);
+}
+
+// Delegación de eventos en el contenedor de resultados (soporta miles de filas sin recargar listeners)
+resultsContainer.addEventListener('click', (e) => {
+    const actionBtn = e.target.closest('[data-action]');
+    if (actionBtn) {
+        const action = actionBtn.dataset.action;
+        if (action === 'expand-all') {
+            expandAllSearchResults();
+        } else if (action === 'load-chunk') {
+            appendNextResultChunk(RENDER_CHUNK_SIZE);
+        } else if (action === 'load-all-chunks') {
+            appendNextResultChunk(currentResults.length - renderedCount);
         }
-    });
+        return;
+    }
+
+    const row = e.target.closest('.result-row');
+    if (!row) return;
+    const idx = parseInt(row.dataset.index, 10);
+    if (!Number.isNaN(idx) && idx >= 0 && idx < currentResults.length) {
+        selectResult(idx, false);
+        loadPreview(currentResults[idx]);
+    }
+});
+
+resultsContainer.addEventListener('dblclick', (e) => {
+    const row = e.target.closest('.result-row');
+    if (!row) return;
+    e.preventDefault();
+    const idx = parseInt(row.dataset.index, 10);
+    if (!Number.isNaN(idx) && idx >= 0 && idx < currentResults.length) {
+        selectResult(idx, false);
+        openFileLocation(currentResults[idx], row);
+    }
+});
+
+// Carga progresiva automática al desplazarse hasta el final en listas expandidas grandes
+resultsContainer.addEventListener('scroll', () => {
+    if (renderedCount >= currentResults.length) return;
+    const nearBottom = resultsContainer.scrollTop + resultsContainer.clientHeight >= resultsContainer.scrollHeight - 240;
+    if (nearBottom) {
+        appendNextResultChunk(RENDER_CHUNK_SIZE);
+    }
+});
+
+function selectResult(index, shouldScroll = true) {
+    if (index < 0 || index >= currentResults.length) return;
+    ensureResultIndexRendered(index);
+    selectedIndex = index;
+
+    const prevSelected = resultsContainer.querySelector('.result-row.selected');
+    if (prevSelected) prevSelected.classList.remove('selected');
+
+    const nextRow = resultsContainer.querySelector(`.result-row[data-index="${index}"]`);
+    if (nextRow) {
+        nextRow.classList.add('selected');
+        if (shouldScroll) {
+            nextRow.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+    }
 }
 
 async function openFileLocation(item, rowEl = null) {
@@ -382,6 +839,19 @@ async function openFileLocation(item, rowEl = null) {
     if (rowEl) {
         rowEl.classList.add('opening-flash');
         setTimeout(() => rowEl.classList.remove('opening-flash'), 450);
+    }
+    if (remoteSharedMode) {
+        if (previewMeta) {
+            previewMeta.textContent = `⬇ Descargando: ${item.name || item.path}`;
+        }
+        const dlUrl = `${apiBase}/api/download?file=${encodeURIComponent(item.path)}`;
+        const link = document.createElement('a');
+        link.href = dlUrl;
+        link.download = item.name || '';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        return;
     }
     if (previewMeta) {
         previewMeta.textContent = `📂 Abriendo ubicación: ${item.path}`;
@@ -1476,7 +1946,7 @@ function drawRadar() {
 
         // Etiqueta numérica anime al lado superior derecho del punto (como el "4" en radar modelo.webp)
         if (idx < 9 || isSelected) {
-            ctx.font = `700 ${isSelected ? 15 : 13}px 'Fredoka', sans-serif`;
+            ctx.font = `700 ${isSelected ? 15 : 13}px 'Trebuchet MS', 'Segoe UI', sans-serif`;
             ctx.lineWidth = 3;
             ctx.strokeStyle = '#032908';
             const label = String(idx + 1);
@@ -1515,30 +1985,34 @@ function drawRadar() {
     requestAnimationFrame(drawRadar);
 }
 
-// Navegación por Teclado
+// Navegación por Teclado (funciona sobre todo `currentResults`, incluso con miles de resultados expandidos)
 window.addEventListener('keydown', (e) => {
+    const active = document.activeElement;
+    const isTypingInput = active === searchInput || active === resultsQuickFilter;
+
     if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        if (radarBlips.length > 0) {
-            selectedIndex = (selectedIndex + 1) % radarBlips.length;
+        if (currentResults.length > 0) {
+            e.preventDefault();
+            selectedIndex = (selectedIndex + 1) % currentResults.length;
             selectResult(selectedIndex);
-            loadPreview(radarBlips[selectedIndex].item);
+            loadPreview(currentResults[selectedIndex]);
         }
     } else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        if (radarBlips.length > 0) {
-            selectedIndex = (selectedIndex - 1 + radarBlips.length) % radarBlips.length;
+        if (currentResults.length > 0) {
+            e.preventDefault();
+            selectedIndex = (selectedIndex - 1 + currentResults.length) % currentResults.length;
             selectResult(selectedIndex);
-            loadPreview(radarBlips[selectedIndex].item);
+            loadPreview(currentResults[selectedIndex]);
         }
     } else if (e.key === ' ') {
-        if (document.activeElement !== searchInput && selectedIndex >= 0 && selectedIndex < radarBlips.length) {
+        if (!isTypingInput && selectedIndex >= 0 && selectedIndex < currentResults.length) {
             e.preventDefault();
-            openQuickLook(radarBlips[selectedIndex].item);
+            openQuickLook(currentResults[selectedIndex]);
         }
     } else if (e.key === 'Enter') {
-        if (selectedIndex >= 0 && selectedIndex < radarBlips.length) {
-            openFileLocation(radarBlips[selectedIndex].item);
+        if (active === resultsQuickFilter) return;
+        if (selectedIndex >= 0 && selectedIndex < currentResults.length) {
+            openFileLocation(currentResults[selectedIndex]);
         }
     } else if (e.key === 'Escape') {
         quickLookModal.classList.remove('open');

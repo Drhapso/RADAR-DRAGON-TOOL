@@ -1,0 +1,8 @@
+{
+  "port": 8092,
+  "lan_mode": "local_agent",
+  "authorized_subnet": "",
+  "shared_paths": [],
+  "libreoffice_path": "",
+  "sync_interval_minutes": 15
+}

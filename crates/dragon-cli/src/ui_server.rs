@@ -3,8 +3,10 @@
 //! en Rust (Tantivy, Redb, Model2Vec, MFT y Extractor), y ejecuta en segundo plano la
 //! indexación automática inicial con checkpoints y validación de arranque.
 
+use crate::config::{LanMode, LoadedSiteConfig};
 use crate::indexer::{
-    resolve_machine_storage_paths, run_startup_auto_sync_and_validate, MachineStoragePaths,
+    get_machine_name, resolve_machine_storage_paths, resolve_shared_server_storage_paths,
+    run_startup_auto_sync_and_validate, run_startup_auto_sync_with_targets, MachineStoragePaths,
     SharedRadarState,
 };
 use anyhow::Result;
@@ -20,42 +22,218 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 
-pub async fn run_ui_server(host: &str, mut port: u16, force_local: bool) -> Result<()> {
-    let machine_paths = resolve_machine_storage_paths(force_local);
-    let state = SharedRadarState::open(
-        &machine_paths.index_dir,
-        &machine_paths.db_path,
-        &machine_paths.vectors_file,
-    )?;
+pub const APP_VERSION: &str = "1.3.0";
 
-    // Regla de primera ejecución: validar si LibreOffice está instalado en este equipo
-    let lo_status = ensure_libreoffice_first_run_check(&state.storage);
+pub struct UiServerOptions {
+    pub host: String,
+    pub port: Option<u16>,
+    pub force_local: bool,
+    pub no_browser: bool,
+    pub strict_port: bool,
+    pub config_path: Option<PathBuf>,
+    pub lan_mode_override: Option<LanMode>,
+}
 
-    // Regla de inicio:
-    // 1. Primera ejecución -> indexación automática de todas las unidades locales de ESTE equipo con checkpoints.
-    // 2. Interrupción previa -> reanudación desde el último punto de control.
-    // 3. Arranques posteriores -> validación de nuevos, modificados por peso/fecha, movidos y eliminados.
-    let bg_state = Arc::clone(&state);
+enum ServerBootState {
+    Loading { started_at_ms: u64, stage: String },
+    Ready(Arc<SharedRadarState>),
+    Failed(String),
+}
+
+struct RuntimeServerContext {
+    machine_name: String,
+    machine_paths: Arc<RwLock<Option<MachineStoragePaths>>>,
+    boot_state: Arc<RwLock<ServerBootState>>,
+    site_config: LoadedSiteConfig,
+    listen_port: u16,
+    bind_lan: bool,
+    sync_running: Arc<AtomicBool>,
+    shared_roots_for_sync: Option<Vec<PathBuf>>,
+    shutdown_notify: Arc<Notify>,
+}
+
+fn get_ready_state(ctx: &RuntimeServerContext) -> Option<Arc<SharedRadarState>> {
+    let guard = ctx.boot_state.read().ok()?;
+    match &*guard {
+        ServerBootState::Ready(st) => Some(Arc::clone(st)),
+        _ => None,
+    }
+}
+
+fn now_ms_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn last_cleanup_script_epoch_secs() -> &'static AtomicU64 {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    &LAST
+}
+
+fn find_index_validation_script() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.to_path_buf());
+            if let Some(repo_root) = parent.parent().and_then(|p| p.parent()) {
+                dirs.push(repo_root.to_path_buf());
+            }
+        }
+    }
+    for dir in dirs {
+        for rel in [
+            PathBuf::from("deploy").join("validar-index-al-abrir.ps1"),
+            PathBuf::from("herramientas").join("validar-index-al-abrir.ps1"),
+        ] {
+            let candidate = dir.join(rel);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Ejecuta `validar-index-al-abrir.ps1` en segundo plano (sin ventana visible) para cerrar
+/// ventanas de comandos auxiliares una vez que la indexación está confirmada como completa.
+fn trigger_console_cleanup_script_debounced(port: u16) {
+    #[cfg(windows)]
+    {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let prev = last_cleanup_script_epoch_secs().load(Ordering::Relaxed);
+        if now_secs.saturating_sub(prev) < 8 {
+            return;
+        }
+        if last_cleanup_script_epoch_secs()
+            .compare_exchange(prev, now_secs, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        if let Some(script_path) = find_index_validation_script() {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            let _ = std::process::Command::new("powershell.exe")
+                .args([
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-WindowStyle",
+                    "Hidden",
+                    "-File",
+                    &script_path.to_string_lossy(),
+                    "-Port",
+                    &port.to_string(),
+                    "-CleanupOnly",
+                ])
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = port;
+    }
+}
+
+fn spawn_background_sync_if_idle(
+    state: &Arc<SharedRadarState>,
+    sync_running: &Arc<AtomicBool>,
+    shared_roots_for_sync: Option<Vec<PathBuf>>,
+    listen_port: u16,
+) -> bool {
+    if sync_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    let bg_state = Arc::clone(state);
+    let bg_flag = Arc::clone(sync_running);
     std::thread::spawn(move || {
-        if let Err(e) = run_startup_auto_sync_and_validate(&bg_state, false) {
-            log::error!("Error en sincronización automática de inicio: {}", e);
+        // Cargar caché RAM de búsqueda rápida y vectors.bin en segundo plano sin bloquear el arranque HTTP
+        bg_state.hydrate_background_caches();
+        let res = match shared_roots_for_sync {
+            Some(roots) => run_startup_auto_sync_with_targets(&bg_state, false, Some(&roots)),
+            None => run_startup_auto_sync_and_validate(&bg_state, false),
+        };
+        bg_flag.store(false, Ordering::SeqCst);
+        match res {
+            Ok(_) => {
+                // Al finalizar completamente la indexación en segundo plano, cerrar ventanas de comandos auxiliares
+                trigger_console_cleanup_script_debounced(listen_port);
+            }
+            Err(e) => {
+                log::error!("Error en sincronización automática de inicio: {}", e);
+                if let Ok(mut t) = bg_state.telemetry.write() {
+                    t.phase = "READY".to_string();
+                    t.last_checkpoint = format!("Error: {}", e);
+                }
+            }
         }
     });
+    true
+}
+
+fn configured_libreoffice_path_store() -> &'static RwLock<Option<PathBuf>> {
+    static STORE: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+    STORE.get_or_init(|| RwLock::new(None))
+}
+
+fn set_configured_libreoffice_path(path: Option<&str>) {
+    if let Ok(mut guard) = configured_libreoffice_path_store().write() {
+        *guard = path
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+    }
+}
+
+pub async fn run_ui_server(options: UiServerOptions) -> Result<()> {
+    let site_config = LoadedSiteConfig::load(options.config_path.as_deref())
+        .with_lan_mode_override(options.lan_mode_override);
+    set_configured_libreoffice_path(site_config.config.libreoffice_path.as_deref());
 
     #[cfg(feature = "lan")]
-    let bind_ip: IpAddr = host.parse().unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]));
+    let bind_ip: IpAddr = options
+        .host
+        .parse()
+        .unwrap_or_else(|_| IpAddr::from([127, 0, 0, 1]));
     #[cfg(not(feature = "lan"))]
     let bind_ip: IpAddr = {
-        let _ = host;
+        let _ = &options.host;
         IpAddr::from([127, 0, 0, 1])
     };
+    let bind_lan = !bind_ip.is_loopback();
+    let active_shared_server = bind_lan && site_config.is_shared_server();
+    let machine_name = get_machine_name();
+
+    // 1. Enlazar el puerto HTTP PRIMERO (< 5 ms), ANTES de abrir/recuperar radar.redb o Tantivy.
+    //    Así la plataforma, /health y el HUD cargan instantáneamente incluso tras un corte eléctrico.
+    let requested_port = options.port.unwrap_or(site_config.config.port);
+    let mut port = requested_port;
     let mut listener = None;
-    for p in port..port + 30 {
+    let max_port_offset = if options.strict_port { 1 } else { 30 };
+    for offset in 0..max_port_offset {
+        let Some(p) = requested_port.checked_add(offset) else {
+            break;
+        };
         let addr = SocketAddr::new(bind_ip, p);
         match TcpListener::bind(addr).await {
             Ok(l) => {
@@ -67,63 +245,442 @@ pub async fn run_ui_server(host: &str, mut port: u16, force_local: bool) -> Resu
         }
     }
     let listener = listener.ok_or_else(|| {
-        anyhow::anyhow!("No se pudo enlazar ningún puerto entre {} y {}", port, port + 30)
+        if options.strict_port {
+            anyhow::anyhow!("El puerto {}:{} ya está ocupado", bind_ip, requested_port)
+        } else {
+            anyhow::anyhow!(
+                "No se pudo enlazar ningún puerto entre {} y {}",
+                requested_port,
+                requested_port.saturating_add(29)
+            )
+        }
     })?;
+
+    let sync_running = Arc::new(AtomicBool::new(false));
+    let shared_roots_for_sync = if active_shared_server {
+        Some(site_config.canonical_shared_roots.clone())
+    } else {
+        None
+    };
+    let machine_paths_slot: Arc<RwLock<Option<MachineStoragePaths>>> = Arc::new(RwLock::new(None));
+    let boot_state: Arc<RwLock<ServerBootState>> = Arc::new(RwLock::new(ServerBootState::Loading {
+        started_at_ms: now_ms_u64(),
+        stage: "Abriendo / verificando base de datos radar.redb...".to_string(),
+    }));
+    let shutdown_notify = Arc::new(Notify::new());
+
+    let shared_ctx = Arc::new(RuntimeServerContext {
+        machine_name: machine_name.clone(),
+        machine_paths: Arc::clone(&machine_paths_slot),
+        boot_state: Arc::clone(&boot_state),
+        site_config,
+        listen_port: port,
+        bind_lan,
+        sync_running: Arc::clone(&sync_running),
+        shared_roots_for_sync: shared_roots_for_sync.clone(),
+        shutdown_notify: Arc::clone(&shutdown_notify),
+    });
+
+    // 2. Abrir Redb + Tantivy + LibreOffice + sincronización en hilo de fondo sin bloquear el puerto HTTP
+    {
+        let boot_ctx = Arc::clone(&shared_ctx);
+        let force_local = options.force_local;
+        std::thread::spawn(move || {
+            let base_paths = resolve_machine_storage_paths(force_local);
+            let resolved_paths = if active_shared_server {
+                resolve_shared_server_storage_paths(&base_paths)
+            } else {
+                base_paths
+            };
+            if let Ok(mut mp) = boot_ctx.machine_paths.write() {
+                *mp = Some(resolved_paths.clone());
+            }
+            if let Ok(mut bs) = boot_ctx.boot_state.write() {
+                if let ServerBootState::Loading { ref mut stage, .. } = *bs {
+                    *stage = format!(
+                        "Abriendo / recuperando base de datos ({})...",
+                        resolved_paths.db_path.display()
+                    );
+                }
+            }
+
+            match SharedRadarState::open_fast(
+                &resolved_paths.index_dir,
+                &resolved_paths.db_path,
+                &resolved_paths.vectors_file,
+            ) {
+                Ok(state) => {
+                    let lo_status = ensure_libreoffice_first_run_check(&state.storage);
+                    if lo_status.installed {
+                        log::info!(
+                            "LibreOffice detectado: {}",
+                            lo_status.path.as_deref().unwrap_or("soffice")
+                        );
+                    }
+                    if let Ok(mut bs) = boot_ctx.boot_state.write() {
+                        *bs = ServerBootState::Ready(Arc::clone(&state));
+                    }
+                    log::info!(
+                        "Base de datos e índice listos ({}); iniciando hidratación y sincronización en segundo plano...",
+                        resolved_paths.data_root.display()
+                    );
+                    spawn_background_sync_if_idle(
+                        &state,
+                        &boot_ctx.sync_running,
+                        boot_ctx.shared_roots_for_sync.clone(),
+                        boot_ctx.listen_port,
+                    );
+                }
+                Err(err) => {
+                    let msg = format!("Error abriendo almacenamiento local: {:#}", err);
+                    log::error!("{}", msg);
+                    if let Ok(mut bs) = boot_ctx.boot_state.write() {
+                        *bs = ServerBootState::Failed(msg);
+                    }
+                }
+            }
+        });
+    }
+
+    // 3. Regla de mantenimiento continuo: sincronización incremental periódica una vez que el estado esté Ready
+    let sync_interval_min = shared_ctx.site_config.config.sync_interval_minutes;
+    if sync_interval_min > 0 {
+        let periodic_ctx = Arc::clone(&shared_ctx);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                sync_interval_min.max(1) * 60,
+            ));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                if let Some(st) = get_ready_state(&periodic_ctx) {
+                    let started = spawn_background_sync_if_idle(
+                        &st,
+                        &periodic_ctx.sync_running,
+                        periodic_ctx.shared_roots_for_sync.clone(),
+                        periodic_ctx.listen_port,
+                    );
+                    if started {
+                        log::info!(
+                            "[AUTO-SYNC] Iniciando actualización periódica de DB (cada {} min)...",
+                            sync_interval_min
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     let local_url = format!("http://127.0.0.1:{}", port);
     println!("╔══════════════════════════════════════════════════════════╗");
     println!("║       DRAGON RADAR TOOL - TACTICAL HUD UI SERVER         ║");
     println!("╚══════════════════════════════════════════════════════════╝");
-    println!("  ⚡ Equipo activo  : {} ({})", machine_paths.machine_name, machine_paths.mode_label);
-    println!("  ⚡ Índice local   : {}", machine_paths.data_root.display());
+    println!("  ⚡ Equipo activo  : {} (Puerto HTTP activo inmediatamente)", machine_name);
     println!("  ⚡ Radar local    : {}", local_url);
+    if let Some(ref cfg_path) = shared_ctx.site_config.source_path {
+        println!("  ⚡ Configuración  : {}", cfg_path.display());
+    }
+    if let Some(ref subnet) = shared_ctx.site_config.config.authorized_subnet {
+        println!("  ⚡ Subred LAN     : {} (aislamiento CIDR activo)", subnet);
+    }
     #[cfg(feature = "lan")]
-    if bind_ip.is_unspecified() {
-        println!("  ⚡ Modo Red LAN   : Web disponible en puerto {} (cada cliente indexa y busca en su propio equipo)", port);
+    if bind_lan {
+        if shared_ctx.site_config.is_shared_server() {
+            println!(
+                "  ⚡ Modo Red LAN   : SERVIDOR COMPARTIDO en puerto {} ({} carpeta(s) autorizada(s))",
+                port,
+                shared_ctx.site_config.canonical_shared_roots.len()
+            );
+            for r in &shared_ctx.site_config.canonical_shared_roots {
+                println!("     └─ Compartida  : {}", r.display());
+            }
+            if shared_ctx.site_config.canonical_shared_roots.is_empty() {
+                println!("  ⚠️ ATENCIÓN       : shared_paths está vacío en config/site_config.json (ninguna carpeta expuesta en LAN)");
+            }
+        } else {
+            println!(
+                "  ⚡ Modo Red LAN   : AGENTE LOCAL POR EQUIPO en puerto {} (cada PC busca solo en sus discos)",
+                port
+            );
+        }
     }
     #[cfg(not(feature = "lan"))]
     println!("  ⚡ Edición        : PORTABLE (Solo equipo local 127.0.0.1, sin red LAN)");
-    if lo_status.installed {
-        println!(
-            "  ⚡ LibreOffice    : Instalado ({}){}",
-            lo_status.path.as_deref().unwrap_or("soffice"),
-            if lo_status.checked_just_now { " [Verificado en 1ª ejecución]" } else { "" }
-        );
-    } else {
-        println!(
-            "  ⚠️ LibreOffice    : NO instalado (se usará visor integrado sin PDF exacto){}",
-            if lo_status.checked_just_now { " [Verificado en 1ª ejecución]" } else { "" }
-        );
+    println!("  ⚡ Base de datos  : Cargando/verificando en segundo plano (HTTP ya en línea)");
+    if !options.no_browser {
+        println!("  ⚡ Abriendo el navegador automáticamente...");
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "start", &local_url])
+                .spawn();
+        }
     }
-    println!("  ⚡ Sincronización y validación de índice activa en segundo plano");
-    println!("  ⚡ Abriendo el navegador automáticamente...");
     println!("  ⚡ (Mantén esta ventana abierta mientras usas el radar)\n");
 
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("cmd")
-            .args(["/c", "start", &local_url])
-            .spawn();
+    loop {
+        tokio::select! {
+            _ = shutdown_notify.notified() => {
+                log::info!("Apagado controlado recibido por /api/shutdown; cerrando base de datos limpiamente...");
+                break;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                log::info!("Señal Ctrl+C recibida; cerrando base de datos limpiamente...");
+                break;
+            }
+            accepted = listener.accept() => {
+                let (socket, _) = accepted?;
+                let conn_ctx = Arc::clone(&shared_ctx);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(socket, conn_ctx).await {
+                        log::debug!("Error en conexión HTTP: {}", e);
+                    }
+                });
+            }
+        }
+    }
+    // Apagado cooperativo real: avisar al hilo indexador en segundo plano, esperar que suelte
+    // radar.redb limpiamente y liberar explícitamente `SharedRadarState` antes de salir de `main()`.
+    if let Some(st) = get_ready_state(&shared_ctx) {
+        st.shutdown_requested.store(true, Ordering::SeqCst);
+        drop(st);
+    }
+    for _ in 0..60 {
+        if !shared_ctx.sync_running.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if let Ok(mut bs) = shared_ctx.boot_state.write() {
+        *bs = ServerBootState::Failed("Servidor apagado limpiamente".to_string());
+    }
+    Ok(())
+}
+
+fn can_access_data_api(peer_is_loopback: bool, ctx: &RuntimeServerContext) -> bool {
+    if peer_is_loopback {
+        return true;
+    }
+    ctx.bind_lan && ctx.site_config.is_shared_server()
+}
+
+fn can_access_file(file: &str, peer_is_loopback: bool, ctx: &RuntimeServerContext) -> bool {
+    if ctx.bind_lan && ctx.site_config.is_shared_server() {
+        return ctx.site_config.is_path_allowed_for_remote(file);
+    }
+    peer_is_loopback
+}
+
+fn build_boot_or_status_json(
+    ctx: &RuntimeServerContext,
+    peer_is_loopback: bool,
+    is_active_shared_server: bool,
+) -> serde_json::Value {
+    if let Some(state) = get_ready_state(ctx) {
+        return build_status_json(&state, ctx, peer_is_loopback, is_active_shared_server);
     }
 
-    let shared_paths = Arc::new(machine_paths);
-    loop {
-        let (socket, _) = listener.accept().await?;
-        let conn_state = Arc::clone(&state);
-        let conn_paths = Arc::clone(&shared_paths);
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, conn_state, conn_paths).await {
-                log::debug!("Error en conexión HTTP: {}", e);
+    let (status_label, phase_label, current_target, current_file, running_bg) =
+        if let Ok(guard) = ctx.boot_state.read() {
+            match &*guard {
+                ServerBootState::Loading { started_at_ms, stage } => {
+                    let elapsed_secs = now_ms_u64().saturating_sub(*started_at_ms) / 1000;
+                    (
+                        "RECOVERING_DB",
+                        "RECOVERING_DB",
+                        stage.clone(),
+                        format!("Verificando / recuperando base de datos ({} s)...", elapsed_secs),
+                        true,
+                    )
+                }
+                ServerBootState::Failed(err) => (
+                    "ERROR",
+                    "ERROR",
+                    err.clone(),
+                    err.clone(),
+                    false,
+                ),
+                ServerBootState::Ready(_) => (
+                    "OPERATIONAL",
+                    "READY",
+                    String::new(),
+                    String::new(),
+                    false,
+                ),
             }
-        });
-    }
+        } else {
+            (
+                "RECOVERING_DB",
+                "RECOVERING_DB",
+                "Inicializando almacenamiento...".to_string(),
+                "Iniciando motor...".to_string(),
+                true,
+            )
+        };
+
+    let (storage_mode, data_dir) = ctx
+        .machine_paths
+        .read()
+        .ok()
+        .and_then(|g| {
+            g.as_ref().map(|mp| {
+                (
+                    mp.mode_label.clone(),
+                    mp.data_root.to_string_lossy().to_string(),
+                )
+            })
+        })
+        .unwrap_or_else(|| ("STARTING".to_string(), ".".to_string()));
+
+    let soffice_path = find_soffice_exe();
+    json!({
+        "status": status_label,
+        "mft_armed": true,
+        "machine_name": ctx.machine_name,
+        "storage_mode": storage_mode,
+        "data_dir": data_dir,
+        "redb_records": 0,
+        "tracked_files": 0,
+        "vector_count": 0,
+        "running_in_background": running_bg,
+        "phase": phase_label,
+        "percent": 0.0,
+        "target_index": 0,
+        "total_targets": 0,
+        "current_target": current_target,
+        "current_file": current_file,
+        "target_processed": 0,
+        "target_total": 0,
+        "new_files": 0,
+        "updated_files": 0,
+        "moved_files": 0,
+        "deleted_files": 0,
+        "skipped_files": 0,
+        "last_checkpoint": current_file,
+        "last_sync_ms": now_ms_u64(),
+        "initial_scan_completed": false,
+        "drives": [],
+        "sync_interval_minutes": ctx.site_config.config.sync_interval_minutes,
+        "office_pdf_available": soffice_path.is_some(),
+        "libreoffice_installed": soffice_path.is_some(),
+        "libreoffice_first_run_checked": false,
+        "libreoffice_path": soffice_path.map(|p| p.to_string_lossy().to_string()),
+        "lan_enabled": cfg!(feature = "lan"),
+        "bind_lan": ctx.bind_lan,
+        "lan_mode": ctx.site_config.config.lan_mode.as_str(),
+        "authorized_subnet": ctx.site_config.config.authorized_subnet,
+        "shared_server_active": is_active_shared_server,
+        "shared_paths_count": ctx.site_config.canonical_shared_roots.len(),
+        "client_is_local": peer_is_loopback,
+        "port": ctx.listen_port,
+        "portable_edition": cfg!(not(feature = "lan")),
+        "version": if cfg!(feature = "lan") { format!("{}-MFT", APP_VERSION) } else { format!("{}-PORTABLE", APP_VERSION) }
+    })
+}
+
+fn build_status_json(
+    state: &SharedRadarState,
+    ctx: &RuntimeServerContext,
+    peer_is_loopback: bool,
+    is_active_shared_server: bool,
+) -> serde_json::Value {
+    let records_count = state.storage.count_records().unwrap_or(0);
+    let tracked_files = state.storage.count_index_states().unwrap_or(0);
+    let vectors_count = state.vector_store.read().map(|vs| vs.len()).unwrap_or(0);
+    let telemetry = state.telemetry.read().map(|t| t.clone()).unwrap_or_default();
+    let running_in_background = ctx.sync_running.load(Ordering::SeqCst);
+
+    let soffice_path = find_soffice_exe();
+    let lo_checked = state
+        .storage
+        .get_setting(LIBREOFFICE_FIRST_RUN_CHECKED_KEY)
+        .ok()
+        .flatten()
+        .is_some();
+
+    let (storage_mode, data_dir) = ctx
+        .machine_paths
+        .read()
+        .ok()
+        .and_then(|g| {
+            g.as_ref().map(|mp| {
+                (
+                    mp.mode_label.clone(),
+                    mp.data_root.to_string_lossy().to_string(),
+                )
+            })
+        })
+        .unwrap_or_else(|| ("LOCAL_PORTABLE".to_string(), ".".to_string()));
+
+    json!({
+        "status": "OPERATIONAL",
+        "mft_armed": true,
+        "machine_name": ctx.machine_name,
+        "storage_mode": storage_mode,
+        "data_dir": data_dir,
+        "redb_records": records_count,
+        "tracked_files": tracked_files,
+        "vector_count": vectors_count,
+        "running_in_background": running_in_background,
+        "phase": telemetry.phase,
+        "percent": telemetry.percent,
+        "target_index": telemetry.target_index,
+        "total_targets": telemetry.total_targets,
+        "current_target": telemetry.current_target,
+        "current_file": telemetry.current_file,
+        "target_processed": telemetry.target_processed,
+        "target_total": telemetry.target_total,
+        "new_files": telemetry.new_files,
+        "updated_files": telemetry.updated_files,
+        "moved_files": telemetry.moved_files,
+        "deleted_files": telemetry.deleted_files,
+        "skipped_files": telemetry.skipped_files,
+        "last_checkpoint": telemetry.last_checkpoint,
+        "last_sync_ms": telemetry.last_sync_ms,
+        "initial_scan_completed": telemetry.initial_scan_completed,
+        "drives": telemetry.drives,
+        "sync_interval_minutes": ctx.site_config.config.sync_interval_minutes,
+        "office_pdf_available": soffice_path.is_some(),
+        "libreoffice_installed": soffice_path.is_some(),
+        "libreoffice_first_run_checked": lo_checked,
+        "libreoffice_path": soffice_path.map(|p| p.to_string_lossy().to_string()),
+        "lan_enabled": cfg!(feature = "lan"),
+        "bind_lan": ctx.bind_lan,
+        "lan_mode": ctx.site_config.config.lan_mode.as_str(),
+        "authorized_subnet": ctx.site_config.config.authorized_subnet,
+        "shared_server_active": is_active_shared_server,
+        "shared_paths_count": ctx.site_config.canonical_shared_roots.len(),
+        "client_is_local": peer_is_loopback,
+        "port": ctx.listen_port,
+        "portable_edition": cfg!(not(feature = "lan")),
+        "version": if cfg!(feature = "lan") { format!("{}-MFT", APP_VERSION) } else { format!("{}-PORTABLE", APP_VERSION) }
+    })
 }
 
 async fn handle_connection(
     mut socket: TcpStream,
-    state: Arc<SharedRadarState>,
-    machine_paths: Arc<MachineStoragePaths>,
+    ctx: Arc<RuntimeServerContext>,
 ) -> Result<()> {
+    let peer_ip = socket.peer_addr().ok().map(|addr| addr.ip());
+    let peer_is_loopback = peer_ip.map(|ip| ip.is_loopback()).unwrap_or(false);
+
+    if let Some(ip) = peer_ip {
+        if !ctx.site_config.is_peer_ip_authorized(ip) {
+            let err = json!({
+                "error": "Acceso rechazado: IP fuera de la subred LAN autorizada",
+                "authorized_subnet": ctx.site_config.config.authorized_subnet
+            });
+            send_response(
+                &mut socket,
+                "403 Forbidden",
+                "application/json; charset=utf-8",
+                err.to_string().as_bytes(),
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     let mut buffer = [0u8; 4096];
     let bytes_read = socket.read(&mut buffer).await?;
     if bytes_read == 0 {
@@ -140,7 +697,9 @@ async fn handle_connection(
     }
 
     #[cfg(feature = "lan")]
-    let mut host_header = String::from("127.0.0.1:8088");
+    let mut host_header = format!("127.0.0.1:{}", ctx.listen_port);
+    #[cfg(feature = "lan")]
+    let mut forwarded_proto = String::from("http");
     let mut range_header: Option<String> = None;
     for line in lines {
         if let Some(_rest) = line.strip_prefix("Host:").or_else(|| line.strip_prefix("host:")) {
@@ -149,6 +708,17 @@ async fn handle_connection(
                 let trimmed = _rest.trim();
                 if !trimmed.is_empty() {
                     host_header = trimmed.to_string();
+                }
+            }
+        } else if let Some(_rest) = line
+            .strip_prefix("X-Forwarded-Proto:")
+            .or_else(|| line.strip_prefix("x-forwarded-proto:"))
+        {
+            #[cfg(feature = "lan")]
+            {
+                let proto = _rest.trim().to_ascii_lowercase();
+                if proto == "https" || proto == "http" {
+                    forwarded_proto = proto;
                 }
             }
         } else if let Some(rest) = line.strip_prefix("Range:").or_else(|| line.strip_prefix("range:")) {
@@ -168,6 +738,8 @@ async fn handle_connection(
         return Ok(());
     }
 
+    let is_active_shared_server = ctx.bind_lan && ctx.site_config.is_shared_server();
+
     match (method, path.as_str()) {
         ("GET", "/") | ("GET", "/index.html") => {
             let content = include_str!("../../../ui/index.html");
@@ -181,54 +753,180 @@ async fn handle_connection(
             let content = include_str!("../../../ui/radar.js");
             send_response(&mut socket, "200 OK", "application/javascript; charset=utf-8", content.as_bytes()).await?;
         }
-        ("GET", "/api/status") => {
+        ("GET", "/health") | ("GET", "/api/server-info") => {
+            let db_ready = get_ready_state(&ctx).is_some();
+            let res = json!({
+                "app": "dragon-radar",
+                "status": "ok",
+                "db_ready": db_ready,
+                "version": APP_VERSION,
+                "port": ctx.listen_port,
+                "bind_lan": ctx.bind_lan,
+                "lan_enabled": cfg!(feature = "lan"),
+                "portable_edition": cfg!(not(feature = "lan")),
+                "lan_mode": ctx.site_config.config.lan_mode.as_str(),
+                "authorized_subnet": ctx.site_config.config.authorized_subnet,
+                "shared_server_active": is_active_shared_server,
+                "shared_paths_count": ctx.site_config.canonical_shared_roots.len(),
+                "client_is_local": peer_is_loopback,
+                "machine_name": ctx.machine_name
+            });
+            send_response(&mut socket, "200 OK", "application/json; charset=utf-8", res.to_string().as_bytes()).await?;
+        }
+        ("GET", "/api/index/stream") => {
+            if !can_access_data_api(peer_is_loopback, &ctx) {
+                let err = json!({
+                    "error": "Modo LAN local_agent activo: los clientes deben usar su agente local en 127.0.0.1",
+                    "lan_mode": "local_agent"
+                });
+                send_response(&mut socket, "403 Forbidden", "application/json; charset=utf-8", err.to_string().as_bytes()).await?;
+                return Ok(());
+            }
+            let headers = "HTTP/1.1 200 OK\r\n\
+                Content-Type: text/event-stream; charset=utf-8\r\n\
+                Cache-Control: no-store, no-cache, must-revalidate\r\n\
+                X-Content-Type-Options: nosniff\r\n\
+                Access-Control-Allow-Origin: *\r\n\
+                Access-Control-Allow-Private-Network: true\r\n\
+                Connection: keep-alive\r\n\r\n";
+            if socket.write_all(headers.as_bytes()).await.is_err() {
+                return Ok(());
+            }
+            let _ = socket.flush().await;
+
+            loop {
+                let payload = build_boot_or_status_json(&ctx, peer_is_loopback, is_active_shared_server);
+                let is_active = ctx.sync_running.load(Ordering::SeqCst)
+                    || payload.get("phase").and_then(|v| v.as_str()).unwrap_or("READY") != "READY";
+                let frame = format!("data: {}\n\n", payload);
+                if socket.write_all(frame.as_bytes()).await.is_err() {
+                    break;
+                }
+                if socket.flush().await.is_err() {
+                    break;
+                }
+                let sleep_ms = if is_active { 500 } else { 2500 };
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+            }
+            return Ok(());
+        }
+        ("GET", "/api/index/validate") | ("POST", "/api/index/validate") => {
+            let Some(state) = get_ready_state(&ctx) else {
+                let res = json!({
+                    "app": "dragon-radar",
+                    "complete": false,
+                    "running_in_background": true,
+                    "resumed_just_now": false,
+                    "close_console_windows": false,
+                    "phase": "RECOVERING_DB",
+                    "percent": 0.0,
+                    "current_target": "Abriendo / recuperando radar.redb...",
+                    "current_file": "Recuperando base de datos en segundo plano...",
+                    "machine_name": ctx.machine_name,
+                    "port": ctx.listen_port
+                });
+                send_response(&mut socket, "200 OK", "application/json; charset=utf-8", res.to_string().as_bytes()).await?;
+                return Ok(());
+            };
+            let cp = state.storage.load_checkpoint().unwrap_or_default();
+            let telemetry = state.telemetry.read().map(|t| t.clone()).unwrap_or_default();
+            let mut is_running = ctx.sync_running.load(Ordering::SeqCst);
+
+            let total_targets = if cp.targets.is_empty() {
+                telemetry.total_targets
+            } else {
+                cp.targets.len()
+            };
+            let pending_targets = if cp.in_progress && !cp.targets.is_empty() {
+                cp.targets.len().saturating_sub(cp.current_target_idx)
+            } else if !cp.initial_scan_completed {
+                total_targets.max(1)
+            } else {
+                0
+            };
+
+            let missing_drives = !is_active_shared_server
+                && telemetry.drives.iter().any(|d| d.status == "MISSING" || d.status == "PENDING");
+
+            let mut is_complete = !is_running
+                && cp.initial_scan_completed
+                && !cp.in_progress
+                && !missing_drives
+                && telemetry.phase == "READY";
+            let mut resumed_just_now = false;
+
+            // Si la indexación está incompleta o falta alguna unidad y no hay un hilo activo, reanudar automáticamente en segundo plano
+            if !is_complete && !is_running {
+                resumed_just_now = spawn_background_sync_if_idle(
+                    &state,
+                    &ctx.sync_running,
+                    ctx.shared_roots_for_sync.clone(),
+                    ctx.listen_port,
+                );
+                if resumed_just_now {
+                    is_running = true;
+                    is_complete = false;
+                }
+            }
+
+            let trigger_cleanup = query_params
+                .get("trigger_script")
+                .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+                .unwrap_or(true);
+            if is_complete && trigger_cleanup {
+                trigger_console_cleanup_script_debounced(ctx.listen_port);
+            }
+
             let records_count = state.storage.count_records().unwrap_or(0);
             let tracked_files = state.storage.count_index_states().unwrap_or(0);
             let vectors_count = state.vector_store.read().map(|vs| vs.len()).unwrap_or(0);
-            let telemetry = state.telemetry.read().map(|t| t.clone()).unwrap_or_default();
-
-            let soffice_path = find_soffice_exe();
-            let lo_checked = state
-                .storage
-                .get_setting(LIBREOFFICE_FIRST_RUN_CHECKED_KEY)
-                .ok()
-                .flatten()
-                .is_some();
 
             let res = json!({
-                "status": "OPERATIONAL",
-                "mft_armed": true,
-                "machine_name": machine_paths.machine_name,
-                "storage_mode": machine_paths.mode_label,
-                "data_dir": machine_paths.data_root.to_string_lossy(),
+                "app": "dragon-radar",
+                "complete": is_complete,
+                "running_in_background": is_running,
+                "resumed_just_now": resumed_just_now,
+                "close_console_windows": is_complete,
+                "phase": telemetry.phase,
+                "percent": telemetry.percent,
+                "current_target": telemetry.current_target,
+                "current_file": telemetry.current_file,
+                "target_processed": telemetry.target_processed,
+                "target_total": telemetry.target_total,
+                "initial_scan_completed": cp.initial_scan_completed,
+                "in_progress": cp.in_progress,
+                "current_target_idx": cp.current_target_idx,
+                "total_targets": total_targets,
+                "pending_targets": pending_targets,
                 "redb_records": records_count,
                 "tracked_files": tracked_files,
                 "vector_count": vectors_count,
-                "phase": telemetry.phase,
-                "target_index": telemetry.target_index,
-                "total_targets": telemetry.total_targets,
-                "current_target": telemetry.current_target,
-                "new_files": telemetry.new_files,
-                "updated_files": telemetry.updated_files,
-                "moved_files": telemetry.moved_files,
-                "deleted_files": telemetry.deleted_files,
-                "skipped_files": telemetry.skipped_files,
-                "last_checkpoint": telemetry.last_checkpoint,
-                "initial_scan_completed": telemetry.initial_scan_completed,
-                "office_pdf_available": soffice_path.is_some(),
-                "libreoffice_installed": soffice_path.is_some(),
-                "libreoffice_first_run_checked": lo_checked,
-                "libreoffice_path": soffice_path.map(|p| p.to_string_lossy().to_string()),
-                "lan_enabled": cfg!(feature = "lan"),
-                "portable_edition": cfg!(not(feature = "lan")),
-                "version": if cfg!(feature = "lan") { "0.1.0-MFT" } else { "0.1.0-PORTABLE" }
+                "last_checkpoint": cp.last_checkpoint_path.unwrap_or(telemetry.last_checkpoint),
+                "last_sync_ms": telemetry.last_sync_ms,
+                "drives": telemetry.drives,
+                "drives_all_ok": !missing_drives,
+                "machine_name": ctx.machine_name,
+                "port": ctx.listen_port
             });
-            send_response(&mut socket, "200 OK", "application/json", res.to_string().as_bytes()).await?;
+            send_response(&mut socket, "200 OK", "application/json; charset=utf-8", res.to_string().as_bytes()).await?;
+        }
+        ("GET", "/api/status") => {
+            if !can_access_data_api(peer_is_loopback, &ctx) {
+                let err = json!({
+                    "error": "Modo LAN local_agent activo: los clientes deben usar su agente local en 127.0.0.1",
+                    "lan_mode": "local_agent"
+                });
+                send_response(&mut socket, "403 Forbidden", "application/json; charset=utf-8", err.to_string().as_bytes()).await?;
+                return Ok(());
+            }
+
+            let res = build_boot_or_status_json(&ctx, peer_is_loopback, is_active_shared_server);
+            send_response(&mut socket, "200 OK", "application/json; charset=utf-8", res.to_string().as_bytes()).await?;
         }
         #[cfg(feature = "lan")]
         ("GET", "/api/agent/launcher") => {
-            let server_url = format!("http://{}", host_header);
-            let bat = build_client_launcher_bat(&server_url);
+            let server_url = format!("{}://{}", forwarded_proto, host_header);
+            let bat = build_client_launcher_bat(&server_url, ctx.listen_port);
             send_download(
                 &mut socket,
                 "application/octet-stream",
@@ -247,15 +945,103 @@ async fn handle_connection(
             }
             send_response(&mut socket, "404 Not Found", "text/plain", b"Ejecutable no disponible").await?;
         }
+        #[cfg(feature = "lan")]
+        ("GET", "/api/agent/libreoffice-info") => {
+            let res = if let Some(msi_path) = find_bundled_libreoffice_msi() {
+                let filename = msi_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("LibreOffice_26.8.1_Win_x86-64.msi")
+                    .to_string();
+                let size_bytes = std::fs::metadata(&msi_path).map(|m| m.len()).unwrap_or(0);
+                json!({
+                    "available": true,
+                    "filename": filename,
+                    "size_bytes": size_bytes
+                })
+            } else {
+                json!({
+                    "available": false,
+                    "filename": null,
+                    "size_bytes": 0
+                })
+            };
+            send_response(&mut socket, "200 OK", "application/json; charset=utf-8", res.to_string().as_bytes()).await?;
+        }
+        #[cfg(feature = "lan")]
+        ("GET", "/api/agent/libreoffice-installer") => {
+            if let Some(msi_path) = find_bundled_libreoffice_msi() {
+                let msi_str = msi_path.to_string_lossy().to_string();
+                serve_download_file(&mut socket, &msi_str).await?;
+            } else {
+                send_response(
+                    &mut socket,
+                    "404 Not Found",
+                    "text/plain; charset=utf-8",
+                    b"Instalador de LibreOffice no encontrado en la carpeta del proyecto",
+                )
+                .await?;
+            }
+        }
         ("GET", "/api/search") => {
+            if !can_access_data_api(peer_is_loopback, &ctx) {
+                send_response(&mut socket, "403 Forbidden", "application/json; charset=utf-8", b"[]").await?;
+                return Ok(());
+            }
+            let Some(state) = get_ready_state(&ctx) else {
+                send_response(&mut socket, "200 OK", "application/json; charset=utf-8", b"[]").await?;
+                return Ok(());
+            };
             let q = query_params.get("q").cloned().unwrap_or_default();
             let mode = query_params.get("mode").cloned().unwrap_or_else(|| "all".to_string());
-            let limit = query_params.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(20);
+            let raw_limit = query_params.get("limit").and_then(|v| v.parse::<usize>().ok());
+            let want_all = query_params
+                .get("all")
+                .map(|v| {
+                    let s = v.trim().to_ascii_lowercase();
+                    s == "1" || s == "true" || s == "yes" || s == "all"
+                })
+                .unwrap_or(false)
+                || raw_limit == Some(0);
+            let limit = if want_all {
+                usize::MAX
+            } else {
+                raw_limit.unwrap_or(50)
+            };
 
-            let results = execute_search(&state, &q, &mode, limit);
-            send_response(&mut socket, "200 OK", "application/json", results.to_string().as_bytes()).await?;
+            let state_clone = Arc::clone(&state);
+            let q_clone = q.clone();
+            let mode_clone = mode.clone();
+            let mut results = tokio::task::spawn_blocking(move || {
+                execute_search(&state_clone, &q_clone, &mode_clone, limit)
+            })
+            .await
+            .unwrap_or_else(|_| json!([]));
+            if is_active_shared_server {
+                if let Some(arr) = results.as_array_mut() {
+                    arr.retain(|item| {
+                        item.get("path")
+                            .and_then(|v| v.as_str())
+                            .map(|p| ctx.site_config.is_indexed_path_in_shared_roots(p))
+                            .unwrap_or(false)
+                    });
+                }
+            }
+            send_response(&mut socket, "200 OK", "application/json; charset=utf-8", results.to_string().as_bytes()).await?;
         }
         ("GET", "/api/extensions") => {
+            if !can_access_data_api(peer_is_loopback, &ctx) {
+                send_response(&mut socket, "403 Forbidden", "application/json; charset=utf-8", br#"{"extensions":[]}"#).await?;
+                return Ok(());
+            }
+            let Some(state) = get_ready_state(&ctx) else {
+                send_response(&mut socket, "200 OK", "application/json; charset=utf-8", br#"{"extensions":[]}"#).await?;
+                return Ok(());
+            };
+            if is_active_shared_server && ctx.site_config.canonical_shared_roots.is_empty() {
+                send_response(&mut socket, "200 OK", "application/json; charset=utf-8", br#"{"extensions":[]}"#).await?;
+                return Ok(());
+            }
             let q = query_params
                 .get("q")
                 .map(|s| s.trim())
@@ -278,6 +1064,11 @@ async fn handle_connection(
         }
         ("GET", "/api/extract") => {
             let file = query_params.get("file").cloned().unwrap_or_default();
+            if !can_access_file(&file, peer_is_loopback, &ctx) {
+                let err = json!({ "success": false, "error": "Acceso denegado fuera de las carpetas compartidas autorizadas" });
+                send_response(&mut socket, "403 Forbidden", "application/json; charset=utf-8", err.to_string().as_bytes()).await?;
+                return Ok(());
+            }
             let p = Path::new(&file);
             let res = if p.exists() {
                 let fmt = detect_format(p);
@@ -296,10 +1087,15 @@ async fn handle_connection(
             } else {
                 json!({ "success": false, "error": "Archivo no encontrado" })
             };
-            send_response(&mut socket, "200 OK", "application/json", res.to_string().as_bytes()).await?;
+            send_response(&mut socket, "200 OK", "application/json; charset=utf-8", res.to_string().as_bytes()).await?;
         }
         ("GET", "/api/preview") => {
             let file = query_params.get("file").cloned().unwrap_or_default();
+            if !can_access_file(&file, peer_is_loopback, &ctx) {
+                let err = json!({ "success": false, "error": "Acceso denegado fuera de las carpetas compartidas autorizadas" });
+                send_response(&mut socket, "403 Forbidden", "application/json; charset=utf-8", err.to_string().as_bytes()).await?;
+                return Ok(());
+            }
             let file_clone = file.clone();
             let res = tokio::task::spawn_blocking(move || build_preview_payload(&file_clone))
                 .await
@@ -308,18 +1104,57 @@ async fn handle_connection(
         }
         ("GET", "/api/raw") => {
             let file = query_params.get("file").cloned().unwrap_or_default();
+            if !can_access_file(&file, peer_is_loopback, &ctx) {
+                send_response(&mut socket, "403 Forbidden", "text/plain; charset=utf-8", b"Acceso denegado").await?;
+                return Ok(());
+            }
             serve_raw_file(&mut socket, &file, range_header.as_deref()).await?;
+        }
+        ("GET", "/api/download") => {
+            let file = query_params.get("file").cloned().unwrap_or_default();
+            if !can_access_file(&file, peer_is_loopback, &ctx) {
+                send_response(&mut socket, "403 Forbidden", "text/plain; charset=utf-8", b"Acceso denegado").await?;
+                return Ok(());
+            }
+            serve_download_file(&mut socket, &file).await?;
         }
         ("GET", "/api/zip-asset") => {
             let file = query_params.get("file").cloned().unwrap_or_default();
+            if !can_access_file(&file, peer_is_loopback, &ctx) {
+                send_response(&mut socket, "403 Forbidden", "text/plain; charset=utf-8", b"Acceso denegado").await?;
+                return Ok(());
+            }
             let entry = query_params.get("entry").cloned().unwrap_or_default();
             serve_zip_asset(&mut socket, &file, &entry).await?;
         }
         ("GET", "/api/office-pdf") => {
             let file = query_params.get("file").cloned().unwrap_or_default();
+            if !can_access_file(&file, peer_is_loopback, &ctx) {
+                send_response(&mut socket, "403 Forbidden", "text/plain; charset=utf-8", b"Acceso denegado").await?;
+                return Ok(());
+            }
             serve_office_pdf(&mut socket, &file, range_header.as_deref()).await?;
         }
+        ("POST", "/api/shutdown") => {
+            if !peer_is_loopback {
+                let err = json!({ "success": false, "error": "Apagado controlado solo permitido desde 127.0.0.1" });
+                send_response(&mut socket, "403 Forbidden", "application/json; charset=utf-8", err.to_string().as_bytes()).await?;
+                return Ok(());
+            }
+            let ok = json!({ "success": true, "message": "Apagado limpio iniciado" });
+            send_response(&mut socket, "200 OK", "application/json; charset=utf-8", ok.to_string().as_bytes()).await?;
+            ctx.shutdown_notify.notify_waiters();
+        }
         ("GET", "/api/open") => {
+            if !peer_is_loopback {
+                let err = json!({
+                    "success": false,
+                    "remote": true,
+                    "error": "Abrir en Explorador solo aplica en el equipo local. Use el botón Descargar."
+                });
+                send_response(&mut socket, "403 Forbidden", "application/json; charset=utf-8", err.to_string().as_bytes()).await?;
+                return Ok(());
+            }
             let file = query_params.get("file").cloned().unwrap_or_default();
             let res = open_in_explorer(&file);
             send_response(&mut socket, "200 OK", "application/json; charset=utf-8", res.to_string().as_bytes()).await?;
@@ -507,19 +1342,35 @@ fn execute_search(state: &SharedRadarState, query: &str, mode: &str, limit: usiz
                 } else {
                     trimmed.to_string()
                 };
-                let fetch_limit = if parsed.explicit_extension_filter { limit * 4 } else { limit };
+                let fetch_limit = if parsed.explicit_extension_filter {
+                    limit.saturating_mul(4)
+                } else {
+                    limit
+                };
                 if let Ok(hits) = state.index_engine.search_content(&effective_q, fetch_limit) {
-                    output_items = hits
-                        .into_par_iter()
+                    let filtered_hits: Vec<_> = hits
+                        .into_iter()
                         .filter(|hit| !parsed.explicit_extension_filter || path_matches_extensions(&hit.path, &parsed.extensions))
-                        .map(|hit| {
+                        .take(limit)
+                        .collect();
+                    const MAX_DISK_SNIPPETS: usize = 8;
+                    output_items = filtered_hits
+                        .into_par_iter()
+                        .enumerate()
+                        .map(|(idx, hit)| {
                             let real_size = if hit.size > 0 {
                                 hit.size
                             } else {
                                 std::fs::metadata(&hit.path).map(|m| m.len()).unwrap_or(0)
                             };
-                            let snippet = extract_matching_snippet(&hit.path, &effective_q, 165)
-                                .unwrap_or_else(|| format!("Coincidencia en contenido (BM25 {:.2})", hit.score));
+                            let snippet = extract_matching_snippet_fast(
+                                state,
+                                &hit.path,
+                                &effective_q,
+                                165,
+                                idx < MAX_DISK_SNIPPETS,
+                            )
+                            .unwrap_or_else(|| format!("Coincidencia en contenido (BM25 {:.2})", hit.score));
                             let badge = determine_badge(&hit.path);
                             json!({
                                 "name": hit.filename,
@@ -537,7 +1388,7 @@ fn execute_search(state: &SharedRadarState, query: &str, mode: &str, limit: usiz
         "semantic" => {
             let q_vec = state.embedder.embed(trimmed);
             if let Ok(vs) = state.vector_store.read() {
-                let hits = vs.search(&q_vec, limit * 2);
+                let hits = vs.search(&q_vec, limit.saturating_mul(2));
                 for hit in hits {
                     if classify_path(&hit.path) != FileCategory::Document || hit.score < 0.22 {
                         continue;
@@ -599,7 +1450,7 @@ fn execute_name_or_extension_category(
     let mut by_path: HashMap<String, HitItem> = HashMap::new();
     let norm_key = |p: &str| if cfg!(windows) { p.to_lowercase() } else { p.to_string() };
 
-    if let Ok(records) = state.storage.search_by_name_ranked(query, category_filter, limit * 2) {
+    if let Ok(records) = state.storage.search_by_name_ranked(query, category_filter, limit.saturating_mul(2)) {
         for (rec, score) in records {
             let path_str = rec.path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
             let key = norm_key(&path_str);
@@ -699,7 +1550,7 @@ fn execute_unified_ranked(
             &parsed.text_tokens,
             category_filter,
             false,
-            limit * 2,
+            limit.saturating_mul(2),
         ) {
             for (rec, ext_score) in ext_hits {
                 let path_str = rec.path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
@@ -722,7 +1573,7 @@ fn execute_unified_ranked(
         }
     } else {
         // 1B. Coincidencias por nombre en Redb (ordenadas por precisión)
-        if let Ok(name_hits) = state.storage.search_by_name_ranked(query, category_filter, limit * 2) {
+        if let Ok(name_hits) = state.storage.search_by_name_ranked(query, category_filter, limit.saturating_mul(2)) {
             for (rec, name_score) in name_hits {
                 let path_str = rec.path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
                 let key = norm_key(&path_str);
@@ -749,7 +1600,7 @@ fn execute_unified_ranked(
                     &[],
                     category_filter,
                     false,
-                    limit * 2,
+                    limit.saturating_mul(2),
                 ) {
                     let ext_upper = bare.to_ascii_uppercase();
                     for (rec, ext_score) in ext_hits {
@@ -784,7 +1635,11 @@ fn execute_unified_ranked(
     let allow_content = matches!(category_filter, None | Some(FileCategory::Document))
         && !text_query.trim().is_empty();
     if allow_content {
-        let fetch_limit = if parsed.explicit_extension_filter { limit * 4 } else { limit * 2 };
+        let fetch_limit = if parsed.explicit_extension_filter {
+            limit.saturating_mul(4)
+        } else {
+            limit.saturating_mul(2)
+        };
         if let Ok(bm25_hits) = state.index_engine.search_content(&text_query, fetch_limit) {
             for hit in bm25_hits {
                 if parsed.explicit_extension_filter && !path_matches_extensions(&hit.path, &parsed.extensions) {
@@ -813,42 +1668,46 @@ fn execute_unified_ranked(
             }
         }
 
-        // 3. Búsqueda semántica solo con umbral estricto (>= 0.28) para evitar ruido irrelevante
-        let q_vec = state.embedder.embed(&text_query);
-        if let Ok(vs) = state.vector_store.read() {
-            let sem_hits = vs.search(&q_vec, fetch_limit);
-            for hit in sem_hits {
-                if hit.score < 0.28 || classify_path(&hit.path) != FileCategory::Document {
-                    continue;
-                }
-                if parsed.explicit_extension_filter && !path_matches_extensions(&hit.path, &parsed.extensions) {
-                    continue;
-                }
-                if is_noisy_build_or_cache_path(&hit.path) {
-                    continue;
-                }
-                let key = norm_key(&hit.path);
-                let sem_boost = hit.score * 160.0;
-                let filename = Path::new(&hit.path)
-                    .file_name()
-                    .map(|f| f.to_string_lossy().to_string())
-                    .unwrap_or_else(|| hit.path.clone());
+        // 3. Búsqueda semántica solo cuando nombre + contenido BM25 arrojaron pocos resultados (< 10),
+        //    evitando escaneo vectorial innecesario de 100k+ vectores y ruido semántico en consultas exactas.
+        if by_path.len() < 10 {
+            let q_vec = state.embedder.embed(&text_query);
+            if let Ok(vs) = state.vector_store.read() {
+                let sem_limit = limit.min(40);
+                let sem_hits = vs.search(&q_vec, sem_limit);
+                for hit in sem_hits {
+                    if hit.score < 0.34 || classify_path(&hit.path) != FileCategory::Document {
+                        continue;
+                    }
+                    if parsed.explicit_extension_filter && !path_matches_extensions(&hit.path, &parsed.extensions) {
+                        continue;
+                    }
+                    if is_noisy_build_or_cache_path(&hit.path) {
+                        continue;
+                    }
+                    let key = norm_key(&hit.path);
+                    let sem_boost = hit.score * 160.0;
+                    let filename = Path::new(&hit.path)
+                        .file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| hit.path.clone());
 
-                by_path
-                    .entry(key)
-                    .and_modify(|c| {
-                        c.score += sem_boost;
-                        if !hit.snippet.is_empty() {
-                            c.snippet = hit.snippet.clone();
-                        }
-                    })
-                    .or_insert_with(|| MergedCandidate {
-                        name: filename,
-                        path: hit.path,
-                        size_label: "Semántico".to_string(),
-                        score: sem_boost,
-                        snippet: hit.snippet,
-                    });
+                    by_path
+                        .entry(key)
+                        .and_modify(|c| {
+                            c.score += sem_boost;
+                            if !hit.snippet.is_empty() {
+                                c.snippet = hit.snippet.clone();
+                            }
+                        })
+                        .or_insert_with(|| MergedCandidate {
+                            name: filename,
+                            path: hit.path,
+                            size_label: "Semántico".to_string(),
+                            score: sem_boost,
+                            snippet: hit.snippet,
+                        });
+                }
             }
         }
     }
@@ -857,15 +1716,27 @@ fn execute_unified_ranked(
     candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     candidates.truncate(limit);
 
-    // Enriquecer con extracto contextual real los documentos que coincidieron por contenido
+    // Enriquecer extractos de contenido usando primero RAM (0 ms) y solo disco ligero (<= 2 MB) para los top 8
     if allow_content {
-        candidates.par_iter_mut().for_each(|c| {
-            if c.snippet.contains("BM25") {
-                if let Some(real_snip) = extract_matching_snippet(&c.path, &text_query, 165) {
-                    c.snippet = real_snip;
+        const MAX_RAM_SNIPPETS: usize = 60;
+        const MAX_DISK_SNIPPETS: usize = 8;
+        let snippet_slice_len = candidates.len().min(MAX_RAM_SNIPPETS);
+        candidates[..snippet_slice_len]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(idx, c)| {
+                if c.snippet.contains("BM25") {
+                    if let Some(real_snip) = extract_matching_snippet_fast(
+                        state,
+                        &c.path,
+                        &text_query,
+                        165,
+                        idx < MAX_DISK_SNIPPETS,
+                    ) {
+                        c.snippet = real_snip;
+                    }
                 }
-            }
-        });
+            });
     }
 
     candidates
@@ -884,9 +1755,64 @@ fn execute_unified_ranked(
         .collect()
 }
 
-/// Extrae un fragmento textual real alrededor de la coincidencia de la consulta (insensible a mayúsculas y acentos).
-fn extract_matching_snippet(path: &str, query: &str, max_chars: usize) -> Option<String> {
-    let text = extract_content(Path::new(path), 80_000).ok()?;
+/// Extrae un fragmento textual alrededor de la consulta priorizando caché en RAM (`VectorStore`, 0 ms)
+/// y limitando lecturas de disco a archivos livianos (<= 2 MB) para mantener latencias < 100 ms.
+fn extract_matching_snippet_fast(
+    state: &SharedRadarState,
+    path: &str,
+    query: &str,
+    max_chars: usize,
+    allow_disk_fallback: bool,
+) -> Option<String> {
+    // 1. Intento instantáneo desde RAM (sin abrir el archivo en disco)
+    let ram_text = state
+        .vector_store
+        .read()
+        .ok()
+        .and_then(|vs| vs.get_snippet_by_path(path).map(|s| s.to_string()));
+    if let Some(ref cached) = ram_text {
+        if let Some(snip) = build_snippet_from_text(cached, query, max_chars) {
+            return Some(snip);
+        }
+    }
+
+    // 2. Respaldo en disco acotado: jamás parsear PDFs/Excels pesados (> 2 MB) durante cada tecleo
+    if allow_disk_fallback {
+        const MAX_LIVE_SNIPPET_FILE_BYTES: u64 = 2 * 1024 * 1024;
+        if let Ok(meta) = std::fs::metadata(path) {
+            if meta.len() <= MAX_LIVE_SNIPPET_FILE_BYTES {
+                let p = Path::new(path);
+                let disk_text = if detect_format(p) == DocumentFormat::Pdf {
+                    extract_pdf_preview(p, 10, 32_000).ok().map(|pr| pr.text)
+                } else {
+                    extract_content(p, 32_000).ok()
+                };
+                if let Some(ref text) = disk_text {
+                    if let Some(snip) = build_snippet_from_text(text, query, max_chars) {
+                        return Some(snip);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Si había texto en RAM aunque la coincidencia esté más adelante en el documento, mostrar encabezado limpio
+    if let Some(cached) = ram_text {
+        let compact = cached.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !compact.is_empty() {
+            let head: String = compact.chars().take(max_chars).collect();
+            return Some(if compact.chars().count() > max_chars {
+                format!("{}...", head)
+            } else {
+                head
+            });
+        }
+    }
+    None
+}
+
+/// Construye un fragmento contextual alrededor de la consulta dentro de un texto ya disponible.
+fn build_snippet_from_text(text: &str, query: &str, max_chars: usize) -> Option<String> {
     if text.trim().is_empty() {
         return None;
     }
@@ -1503,6 +2429,84 @@ async fn serve_raw_file(
     serve_path_with_mime(socket, p, mime, range_header).await
 }
 
+fn sanitize_ascii_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "archivo".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn rfc5987_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(*b, b'-' | b'_' | b'.' | b'~') {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
+}
+
+async fn serve_download_file(socket: &mut TcpStream, file: &str) -> Result<()> {
+    let p = Path::new(file);
+    if !p.exists() || !p.is_file() {
+        send_response(socket, "404 Not Found", "text/plain; charset=utf-8", b"Archivo no encontrado").await?;
+        return Ok(());
+    }
+
+    let mut f = match tokio::fs::File::open(p).await {
+        Ok(f) => f,
+        Err(_) => {
+            send_response(socket, "403 Forbidden", "text/plain; charset=utf-8", b"No se pudo leer el archivo").await?;
+            return Ok(());
+        }
+    };
+    let total_len = f.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let raw_name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("archivo");
+    let ascii_name = sanitize_ascii_filename(raw_name);
+    let utf8_encoded = rfc5987_encode(raw_name);
+
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\n\
+        Content-Type: application/octet-stream\r\n\
+        Content-Length: {total_len}\r\n\
+        Content-Disposition: attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{utf8_encoded}\r\n\
+        X-Content-Type-Options: nosniff\r\n\
+        Cache-Control: no-store\r\n\
+        Access-Control-Allow-Origin: *\r\n\
+        Access-Control-Allow-Private-Network: true\r\n\
+        Connection: close\r\n\r\n"
+    );
+    socket.write_all(headers.as_bytes()).await?;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        socket.write_all(&buf[..n]).await?;
+    }
+    socket.flush().await?;
+    Ok(())
+}
+
 async fn serve_path_with_mime(
     socket: &mut TcpStream,
     p: &Path,
@@ -1608,6 +2612,13 @@ async fn serve_zip_asset(socket: &mut TcpStream, file: &str, entry: &str) -> Res
 }
 
 fn find_soffice_exe() -> Option<PathBuf> {
+    if let Ok(guard) = configured_libreoffice_path_store().read() {
+        if let Some(ref custom) = *guard {
+            if custom.is_file() {
+                return Some(custom.clone());
+            }
+        }
+    }
     #[cfg(windows)]
     {
         let mut candidates: Vec<PathBuf> = Vec::new();
@@ -1807,20 +2818,75 @@ async fn serve_office_pdf(
 }
 
 #[cfg(feature = "lan")]
-fn build_client_launcher_bat(server_url: &str) -> String {
+fn find_bundled_libreoffice_msi() -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            dirs.push(parent.to_path_buf());
+            if let Some(repo_root) = parent.parent().and_then(|p| p.parent()) {
+                dirs.push(repo_root.to_path_buf());
+            }
+        }
+    }
+
+    for dir in dirs {
+        let exact = dir.join("LibreOffice_26.8.1_Win_x86-64.msi");
+        if exact.is_file() {
+            return Some(exact);
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut matches: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(|n| {
+                                let l = n.to_ascii_lowercase();
+                                l.starts_with("libreoffice") && l.ends_with(".msi")
+                            })
+                            .unwrap_or(false)
+                })
+                .collect();
+            matches.sort();
+            if let Some(found) = matches.pop() {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(feature = "lan")]
+fn build_client_launcher_bat(server_url: &str, port: u16) -> String {
     format!(
         "@echo off\r\n\
+        setlocal\r\n\
         title Radar del Dragon - Agente Local del Equipo\r\n\
         set \"APP_DIR=%LOCALAPPDATA%\\DragonRadar\\bin\"\r\n\
         set \"EXE_PATH=%APP_DIR%\\dragon.exe\"\r\n\
         if not exist \"%APP_DIR%\" mkdir \"%APP_DIR%\"\r\n\
         if not exist \"%EXE_PATH%\" (\r\n\
             echo Descargando motor local desde {server_url}...\r\n\
-            powershell -NoProfile -Command \"Invoke-WebRequest -Uri '{server_url}/api/agent/binary' -OutFile '%EXE_PATH%'\"\r\n\
+            powershell -NoProfile -Command \"$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri '{server_url}/api/agent/binary' -OutFile '%EXE_PATH%' -UseBasicParsing\"\r\n\
         )\r\n\
-        echo Iniciando indice y buscador local en %COMPUTERNAME%...\r\n\
-        \"%EXE_PATH%\" ui --local\r\n",
-        server_url = server_url
+        set \"LO_FOUND=0\"\r\n\
+        if exist \"%ProgramFiles%\\LibreOffice\\program\\soffice.com\" set \"LO_FOUND=1\"\r\n\
+        if exist \"%ProgramFiles%\\LibreOffice\\program\\soffice.exe\" set \"LO_FOUND=1\"\r\n\
+        if exist \"%ProgramFiles(x86)%\\LibreOffice\\program\\soffice.com\" set \"LO_FOUND=1\"\r\n\
+        if exist \"%LOCALAPPDATA%\\Programs\\LibreOffice\\program\\soffice.com\" set \"LO_FOUND=1\"\r\n\
+        if \"%LO_FOUND%\"==\"0\" (\r\n\
+            echo LibreOffice no detectado en %COMPUTERNAME%. Verificando instalador en {server_url}...\r\n\
+            powershell -NoProfile -ExecutionPolicy Bypass -Command \"$ErrorActionPreference='Continue'; $ProgressPreference='SilentlyContinue'; try {{ $info = Invoke-RestMethod -Uri '{server_url}/api/agent/libreoffice-info' -TimeoutSec 5; if ($info.available) {{ $tmpDir = Join-Path $env:TEMP 'DragonRadar'; New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null; $msi = Join-Path $tmpDir $info.filename; Write-Host ('Copiando ' + $info.filename + ' desde el servidor...'); Invoke-WebRequest -Uri '{server_url}/api/agent/libreoffice-installer' -OutFile $msi -UseBasicParsing; Write-Host 'Instalando LibreOffice (se solicitara autorizacion de Administrador UAC)...'; $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList ('/i \"' + $msi + '\" /qn /norestart') -Verb RunAs -Wait -PassThru; if ($p.ExitCode -in @(0,3010)) {{ Write-Host 'LibreOffice instalado correctamente.' }} else {{ Write-Warning ('Instalacion finalizada con codigo ' + $p.ExitCode) }}; Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue }} }} catch {{ Write-Warning ('No se pudo instalar LibreOffice automaticamente: ' + $_.Exception.Message) }}\"\r\n\
+        )\r\n\
+        echo Iniciando indice y buscador local en %COMPUTERNAME% (puerto {port})...\r\n\
+        \"%EXE_PATH%\" ui --local --port {port} --no-browser\r\n",
+        server_url = server_url,
+        port = port
     )
 }
 
@@ -1872,6 +2938,12 @@ async fn send_response(
         "HTTP/1.1 {}\r\n\
         Content-Type: {}\r\n\
         Content-Length: {}\r\n\
+        Cache-Control: no-store, private, max-age=0\r\n\
+        Pragma: no-cache\r\n\
+        X-Content-Type-Options: nosniff\r\n\
+        Referrer-Policy: no-referrer\r\n\
+        X-Frame-Options: SAMEORIGIN\r\n\
+        Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: http://127.0.0.1:*; media-src 'self' blob: http://127.0.0.1:*; frame-src 'self' blob: http://127.0.0.1:*; connect-src 'self' http://127.0.0.1:*; object-src 'none'; base-uri 'none'; frame-ancestors 'self'\r\n\
         Access-Control-Allow-Origin: *\r\n\
         Access-Control-Allow-Private-Network: true\r\n\
         Connection: close\r\n\r\n",

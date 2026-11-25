@@ -12,13 +12,51 @@ pub struct FallbackScanResult {
     pub metrics: ScanMetrics,
 }
 
-/// Escanea un directorio o unidad usando `jwalk` (paralelismo automático por hilos de CPU).
+/// Escanea un directorio, unidad o archivo individual usando `jwalk` (paralelismo automático por hilos de CPU).
 pub fn scan_path_fallback<P: AsRef<Path>>(root: P) -> Result<FallbackScanResult, String> {
     let root_path = root.as_ref().to_path_buf();
     let start = Instant::now();
 
     if !root_path.exists() {
         return Err(format!("La ruta especificada no existe: {:?}", root_path));
+    }
+
+    // Camino rápido determinista para archivos individuales (ej. archivos sueltos en raíz de unidad C:\ o D:\)
+    if root_path.is_file() {
+        let name = root_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let meta = std::fs::metadata(&root_path).ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified_ms = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let record = FileRecord {
+            id: stable_path_id(&root_path),
+            parent_id: 0,
+            name,
+            path: Some(root_path.clone()),
+            size,
+            attributes: 0,
+            modified_ms,
+            is_directory: false,
+        };
+        let duration = start.elapsed();
+        return Ok(FallbackScanResult {
+            root_path: root_path.clone(),
+            records: vec![record],
+            metrics: ScanMetrics {
+                volume_or_path: root_path.to_string_lossy().into_owned(),
+                total_files: 1,
+                total_directories: 0,
+                duration_ms: duration.as_millis() as u64,
+                scan_method: ScanMethod::FileSystemWalk,
+            },
+        });
     }
 
     let mut records = Vec::with_capacity(50_000);

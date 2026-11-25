@@ -5,13 +5,19 @@
 *.exe
 !PORTABLE/dragon.exe
 
-# Local Dragon Radar runtime indexes and databases
+# Local Dragon Radar runtime indexes, databases and private config
 /.dragon-data/
 /.dragon-index/
+/.dragon-shared-data/
+/.dragon-shared-index/
 /.dragon-models/
 /PORTABLE/.dragon-data/
 /PORTABLE/.dragon-index/
+/PORTABLE/.dragon-shared-data/
+/PORTABLE/.dragon-shared-index/
 /PORTABLE/.dragon-models/
+/config/site_config.json
+/dist/
 
 # OS & Editor files
 .DS_Store
@@ -19,3 +25,8 @@ Thumbs.db
 .vscode/
 .idea/
 *.log
+
+# Large external installers and local encrypted credentials (never commit to Git)
+*.msi
+*.cred.xml
+config/admin_credential*

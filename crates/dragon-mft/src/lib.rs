@@ -144,13 +144,68 @@ pub fn discover_fixed_drives() -> Vec<String> {
     }
 }
 
-/// Descubre todas las rutas locales indexables en el equipo omitiendo carpetas del SO.
+fn is_dir_readable(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return false;
+        }
+    }
+    std::fs::read_dir(path).is_ok()
+}
+
+fn is_indexable_root_file(path: &Path, is_c_drive: bool) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return false;
+        }
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    if lower.is_empty()
+        || lower.starts_with('$')
+        || lower.starts_with('.')
+        || lower.starts_with("ntuser.")
+        || lower.starts_with("usrclass.")
+        || lower.starts_with("dumpstack.log")
+        || lower.ends_with(".tmp")
+        || matches!(
+            lower.as_str(),
+            "pagefile.sys"
+                | "hiberfil.sys"
+                | "swapfile.sys"
+                | "bootmgr"
+                | "bootnxt"
+                | "bootsect.bak"
+                | "desktop.ini"
+                | "thumbs.db"
+                | "autorun.inf"
+        )
+    {
+        return false;
+    }
+    if is_c_drive && lower.ends_with(".sys") {
+        return false;
+    }
+    std::fs::File::open(path).is_ok()
+}
+
+/// Descubre todas las rutas locales indexables en el equipo (carpetas y archivos sueltos en raíz)
+/// omitiendo carpetas/archivos del SO y directorios inaccesibles por permisos o junctions.
 pub fn discover_local_user_targets(only_user_docs: bool) -> Vec<PathBuf> {
     let mut targets = Vec::new();
     let drives = discover_fixed_drives();
 
     let system_exclusions = [
         "windows",
+        "windows.old",
         "program files",
         "program files (x86)",
         "programdata",
@@ -162,6 +217,8 @@ pub fn discover_local_user_targets(only_user_docs: bool) -> Vec<PathBuf> {
         "msocache",
         "config.msi",
         "windowsapps",
+        "onedrivetemp",
+        "found.000",
     ];
 
     let profile_exclusions = [
@@ -176,6 +233,7 @@ pub fn discover_local_user_targets(only_user_docs: bool) -> Vec<PathBuf> {
         "application data",
         "cookies",
         "local settings",
+        "my documents",
         "nethood",
         "printhood",
         "recent",
@@ -189,22 +247,32 @@ pub fn discover_local_user_targets(only_user_docs: bool) -> Vec<PathBuf> {
     for drive in drives {
         let drive_lower = drive.to_ascii_lowercase();
         if drive_lower.starts_with("c:") {
-            // 1. Perfiles de usuario en C:\Users
+            // 1. Perfiles de usuario accesibles en C:\Users
             let users_dir = Path::new(&drive).join("Users");
             if let Ok(entries) = std::fs::read_dir(&users_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if !path.is_dir() {
+                    if !is_dir_readable(&path) {
                         continue;
                     }
                     let name_lower = entry.file_name().to_string_lossy().to_lowercase();
+                    if name_lower == "public" {
+                        // Incluir carpetas útiles de C:\Users\Public (Documentos, Escritorio, Descargas, Imágenes)
+                        for sub in ["Documents", "Desktop", "Downloads", "Pictures"] {
+                            let sub_path = path.join(sub);
+                            if is_dir_readable(&sub_path) {
+                                targets.push(sub_path);
+                            }
+                        }
+                        continue;
+                    }
                     if profile_exclusions.contains(&name_lower.as_str()) || name_lower.starts_with("defaultuser") {
                         continue;
                     }
 
                     for sub in base_user_folders {
                         let sub_path = path.join(sub);
-                        if sub_path.is_dir() {
+                        if is_dir_readable(&sub_path) {
                             targets.push(sub_path);
                         }
                     }
@@ -213,18 +281,21 @@ pub fn discover_local_user_targets(only_user_docs: bool) -> Vec<PathBuf> {
                         if let Ok(user_entries) = std::fs::read_dir(&path) {
                             for ue in user_entries.flatten() {
                                 let up = ue.path();
-                                if !up.is_dir() {
-                                    continue;
+                                if is_dir_readable(&up) {
+                                    let uname = ue.file_name().to_string_lossy().to_string();
+                                    let ulower = uname.to_lowercase();
+                                    if ulower.starts_with('.')
+                                        || ulower.starts_with('$')
+                                        || user_subdir_exclusions.contains(&ulower.as_str())
+                                        || base_user_folders.iter().any(|b| b.eq_ignore_ascii_case(&uname))
+                                    {
+                                        continue;
+                                    }
+                                    targets.push(up);
+                                } else if is_indexable_root_file(&up, true) {
+                                    // Archivos sueltos directamente dentro de C:\Users\<usuario>\
+                                    targets.push(up);
                                 }
-                                let uname = ue.file_name().to_string_lossy().to_string();
-                                let ulower = uname.to_lowercase();
-                                if ulower.starts_with('.')
-                                    || user_subdir_exclusions.contains(&ulower.as_str())
-                                    || base_user_folders.iter().any(|b| b.eq_ignore_ascii_case(&uname))
-                                {
-                                    continue;
-                                }
-                                targets.push(up);
                             }
                         }
                     }
@@ -232,41 +303,78 @@ pub fn discover_local_user_targets(only_user_docs: bool) -> Vec<PathBuf> {
             }
 
             if !only_user_docs {
-                // 2. Carpetas no-SO en la raíz de C:\
+                // 2. Primero archivos sueltos y luego carpetas no-SO en la raíz de C:\
                 if let Ok(root_entries) = std::fs::read_dir(&drive) {
+                    let mut root_dirs = Vec::new();
                     for entry in root_entries.flatten() {
                         let path = entry.path();
-                        if !path.is_dir() {
-                            continue;
+                        if is_indexable_root_file(&path, true) {
+                            targets.push(path);
+                        } else if is_dir_readable(&path) {
+                            let name_lower = entry.file_name().to_string_lossy().to_lowercase();
+                            if name_lower == "users"
+                                || name_lower.starts_with('$')
+                                || name_lower.starts_with(".trash")
+                                || system_exclusions.contains(&name_lower.as_str())
+                            {
+                                continue;
+                            }
+                            root_dirs.push(path);
                         }
+                    }
+                    targets.extend(root_dirs);
+                }
+            }
+        } else {
+            // Unidades secundarias (D:, E:, F:, etc.): primero archivos sueltos en raíz y luego carpetas
+            if let Ok(root_entries) = std::fs::read_dir(&drive) {
+                let mut drive_dirs = Vec::new();
+                for entry in root_entries.flatten() {
+                    let path = entry.path();
+                    if is_indexable_root_file(&path, false) {
+                        targets.push(path);
+                    } else if is_dir_readable(&path) {
                         let name_lower = entry.file_name().to_string_lossy().to_lowercase();
-                        if name_lower == "users"
+                        if name_lower.starts_with('$')
                             || name_lower.starts_with(".trash")
                             || system_exclusions.contains(&name_lower.as_str())
                         {
                             continue;
                         }
-                        targets.push(path);
+                        drive_dirs.push(path);
                     }
                 }
-            }
-        } else {
-            // Unidades secundarias (D:, E:, etc.): todo excepto carpetas de sistema/SO
-            if let Ok(root_entries) = std::fs::read_dir(&drive) {
-                for entry in root_entries.flatten() {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        continue;
-                    }
-                    let name_lower = entry.file_name().to_string_lossy().to_lowercase();
-                    if name_lower.starts_with(".trash") || system_exclusions.contains(&name_lower.as_str()) {
-                        continue;
-                    }
-                    targets.push(path);
-                }
+                targets.extend(drive_dirs);
             }
         }
     }
 
     targets
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_file_filter_excludes_os_files_and_keeps_user_docs() {
+        let tmp = std::env::temp_dir().join(format!("dragon_mft_root_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let user_doc = tmp.join("ORDENES 2026.xlsx");
+        let sys_file = tmp.join("pagefile.sys");
+        let ntuser = tmp.join("NTUSER.DAT");
+        std::fs::write(&user_doc, b"ok").unwrap();
+        std::fs::write(&sys_file, b"sys").unwrap();
+        std::fs::write(&ntuser, b"reg").unwrap();
+
+        assert!(is_indexable_root_file(&user_doc, true));
+        assert!(is_indexable_root_file(&user_doc, false));
+        assert!(!is_indexable_root_file(&sys_file, true));
+        assert!(!is_indexable_root_file(&sys_file, false));
+        assert!(!is_indexable_root_file(&ntuser, true));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Compilador oficial de Radar del Dragón (Dragon Radar Tool).
     Compila los cambios en dragon.exe (edición estándar) y genera la edición PORTABLE
@@ -46,8 +46,29 @@ if ($SoloEstandar -and $SoloPortable) {
     exit 1
 }
 
+$cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+if ((Test-Path -LiteralPath (Join-Path $cargoBin "cargo.exe")) -and ($env:PATH -notlike "*$cargoBin*")) {
+    $env:PATH = "$cargoBin;$env:PATH"
+}
+
+# Propagar proxy del sistema Windows (PAC/WinINet) a cargo/rustup si no esta definido en el entorno
+if (-not $env:HTTPS_PROXY) {
+    try {
+        $probeUri = [Uri]"https://static.rust-lang.org/"
+        $sysProxy = [System.Net.WebRequest]::GetSystemWebProxy().GetProxy($probeUri)
+        if ($sysProxy -and ($sysProxy.AbsoluteUri -ne $probeUri.AbsoluteUri)) {
+            $env:HTTPS_PROXY = $sysProxy.AbsoluteUri.TrimEnd('/')
+            $env:HTTP_PROXY  = $env:HTTPS_PROXY
+            $env:NO_PROXY    = "127.0.0.1,localhost"
+        }
+    } catch {}
+}
+
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    Write-Host "[ERROR] No se encontro 'cargo' (Rust Toolchain) en el PATH." -ForegroundColor Red
+    Write-Host "[ERROR] No se encontro 'cargo' (Rust Toolchain) en el PATH ni en $cargoBin." -ForegroundColor Red
+    Write-Host "        Para instalar Rust en Windows (requiere C++ Build Tools o toolchain GNU):" -ForegroundColor Yellow
+    Write-Host "          winget install --id Rustlang.Rustup -e" -ForegroundColor White
+    Write-Host "          winget install --id Microsoft.VisualStudio.2022.BuildTools -e --override `"--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended`"" -ForegroundColor White
     exit 1
 }
 
@@ -55,9 +76,22 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 $runningDragon = Get-Process -Name "dragon" -ErrorAction SilentlyContinue
 if ($runningDragon) {
     if ($KillRunning) {
-        Write-Host "[*] Cerrando instancias activas de dragon.exe ($($runningDragon.Count))..." -ForegroundColor Yellow
-        $runningDragon | Stop-Process -Force
-        Start-Sleep -Milliseconds 600
+        Write-Host "[*] Solicitando cierre limpio de dragon.exe para proteger radar.redb..." -ForegroundColor Yellow
+        try {
+            Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:8092/api/shutdown" -TimeoutSec 2 -ErrorAction SilentlyContinue | Out-Null
+        } catch {}
+        for ($w = 0; $w -lt 16; $w++) {
+            Start-Sleep -Milliseconds 500
+            if (-not (Get-Process -Name "dragon" -ErrorAction SilentlyContinue)) {
+                break
+            }
+        }
+        $stillRunning = Get-Process -Name "dragon" -ErrorAction SilentlyContinue
+        if ($stillRunning) {
+            Write-Host "[*] Forzando cierre residual de dragon.exe ($($stillRunning.Count))..." -ForegroundColor Yellow
+            $stillRunning | Stop-Process -Force
+            Start-Sleep -Milliseconds 600
+        }
     } else {
         Write-Host "[AVISO] Hay una instancia de dragon.exe en ejecucion (PID: $($runningDragon.Id -join ', '))." -ForegroundColor Yellow
         Write-Host "        Si falla al copiar el ejecutable, cierra la ventana del radar o usa -KillRunning." -ForegroundColor Yellow

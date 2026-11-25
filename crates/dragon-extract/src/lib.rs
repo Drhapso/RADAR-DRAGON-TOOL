@@ -73,7 +73,7 @@ pub fn extract_content<P: AsRef<Path>>(path: P, max_bytes: usize) -> Result<Stri
     let format = detect_format(p);
 
     match format {
-        DocumentFormat::Pdf => pdf::extract_pdf_text(p, 150, max_bytes),
+        DocumentFormat::Pdf => pdf::extract_pdf_text(p, 300, max_bytes),
         DocumentFormat::Docx => office::extract_docx_text(p, max_bytes),
         DocumentFormat::Xlsx => office::extract_xlsx_text(p, max_bytes),
         DocumentFormat::Pptx => office::extract_pptx_text(p, max_bytes),

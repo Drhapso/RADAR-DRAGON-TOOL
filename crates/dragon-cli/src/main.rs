@@ -11,6 +11,7 @@ use dragon_storage::DragonStorage;
 use std::path::Path;
 use std::time::Instant;
 
+mod config;
 mod indexer;
 mod ui_server;
 
@@ -145,11 +146,11 @@ enum Commands {
     },
     /// Inicia el servidor stdio de Model Context Protocol (MCP) para conectar agentes IA
     Mcp,
-    /// Abre la interfaz visual Dragon Radar conectada al índice local de este equipo
+    /// Abre la interfaz visual Dragon Radar conectada al índice local o compartido en LAN
     Ui {
-        /// Puerto TCP para el servidor web local
-        #[arg(short, long, default_value_t = 8088)]
-        port: u16,
+        /// Puerto TCP para el servidor web (por defecto 8092 o el definido en config/site_config.json)
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Dirección IP de escucha (127.0.0.1 local; en compilación estándar 0.0.0.0 para red LAN)
         #[arg(long, default_value = "127.0.0.1")]
@@ -159,6 +160,23 @@ enum Commands {
         #[cfg(feature = "lan")]
         #[arg(long, default_value_t = false)]
         lan: bool,
+
+        /// Modo LAN híbrido: "local_agent" (cada PC indexa sus discos) o "shared_server" (carpetas compartidas)
+        #[cfg(feature = "lan")]
+        #[arg(long)]
+        lan_mode: Option<String>,
+
+        /// Ruta explícita al archivo config/site_config.json
+        #[arg(long)]
+        config: Option<String>,
+
+        /// No abrir el navegador automáticamente al iniciar el servidor
+        #[arg(long, default_value_t = false)]
+        no_browser: bool,
+
+        /// Falla si el puerto solicitado está ocupado en lugar de saltar a otro puerto
+        #[arg(long, default_value_t = false)]
+        strict_port: bool,
 
         /// Fuerza guardar el índice exclusivamente en la carpeta local de este equipo
         #[arg(long, default_value_t = false)]
@@ -174,10 +192,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Commands::Ui {
-        port: 8088,
+        port: None,
         host: "127.0.0.1".to_string(),
         #[cfg(feature = "lan")]
         lan: false,
+        #[cfg(feature = "lan")]
+        lan_mode: None,
+        config: None,
+        no_browser: false,
+        strict_port: false,
         local: false,
     });
 
@@ -452,13 +475,58 @@ async fn main() -> anyhow::Result<()> {
             dragon_mcp::run_stdio_server().await?;
         }
         #[cfg(feature = "lan")]
-        Commands::Ui { port, host, lan, local } => {
+        Commands::Ui {
+            port,
+            host,
+            lan,
+            lan_mode,
+            config,
+            no_browser,
+            strict_port,
+            local,
+        } => {
             let bind_host = if lan { "0.0.0.0".to_string() } else { host };
-            ui_server::run_ui_server(&bind_host, port, local).await?;
+            let lan_mode_override = lan_mode
+                .as_deref()
+                .map(|raw| {
+                    config::LanMode::parse_loose(raw).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Valor inválido para --lan-mode: '{}' (use 'local_agent' o 'shared_server')",
+                            raw
+                        )
+                    })
+                })
+                .transpose()?;
+            ui_server::run_ui_server(ui_server::UiServerOptions {
+                host: bind_host,
+                port,
+                force_local: local,
+                no_browser,
+                strict_port,
+                config_path: config.map(std::path::PathBuf::from),
+                lan_mode_override,
+            })
+            .await?;
         }
         #[cfg(not(feature = "lan"))]
-        Commands::Ui { port, host: _, local } => {
-            ui_server::run_ui_server("127.0.0.1", port, local).await?;
+        Commands::Ui {
+            port,
+            host: _,
+            config,
+            no_browser,
+            strict_port,
+            local,
+        } => {
+            ui_server::run_ui_server(ui_server::UiServerOptions {
+                host: "127.0.0.1".to_string(),
+                port,
+                force_local: local,
+                no_browser,
+                strict_port,
+                config_path: config.map(std::path::PathBuf::from),
+                lan_mode_override: None,
+            })
+            .await?;
         }
         Commands::Info => {
             let paths = indexer::resolve_machine_storage_paths(false);
