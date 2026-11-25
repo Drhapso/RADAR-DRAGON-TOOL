@@ -1,4 +1,4 @@
-// Dragon Radar Tool - Motor Visual de Radar Táctico (Canvas + HUD)
+// Dragon Radar Tool - Motor Visual Anime Estilo Akira Toriyama (Basado en radar modelo.webp)
 
 const canvas = document.getElementById('radarCanvas');
 const ctx = canvas.getContext('2d');
@@ -10,16 +10,20 @@ const quickLookModal = document.getElementById('quickLookModal');
 const modalTitle = document.getElementById('modalTitle');
 const modalCodePreview = document.getElementById('modalCodePreview');
 const modalCloseBtn = document.getElementById('modalCloseBtn');
+const radarTopBtn = document.getElementById('radarTopBtn');
+const sweepStatusEl = document.getElementById('sweepStatus');
 
-// Estado del Radar
-let sweepAngle = 0;
-const sweepSpeed = 0.04;
+// Estado del Radar Anime
+let pulsePhase = 0;
+let pingWaveRadius = 0; // Onda de ping al pulsar el botón superior
+let pingActive = false;
+let zoomLevel = 1; // 1 = cuadrícula clásica 8x8, 2 = zoom 12x12, 3 = zoom 5x5
 let radarBlips = [];
 let selectedIndex = -1;
 let currentResults = [];
 let currentMode = 'all';
 
-// Cargar estado real de Dragon Radar desde el servidor (incluye progreso de checkpoints/validación)
+// Cargar estado real de Dragon Radar desde el servidor
 async function updateHudStatus() {
     try {
         const res = await fetch('/api/status');
@@ -32,13 +36,13 @@ async function updateHudStatus() {
             }
             if (statusInd) {
                 if (data.phase === 'INITIAL_INDEXING') {
-                    statusInd.innerHTML = `<span class="blink-dot"></span> INDEXACIÓN INICIAL [${data.target_index}/${data.total_targets}] (+${data.new_files})`;
+                    statusInd.innerHTML = `<span class="blink-dot"></span> INDEXANDO [${data.target_index}/${data.total_targets}] (+${data.new_files})`;
                 } else if (data.phase === 'RESUMING_CHECKPOINT') {
                     statusInd.innerHTML = `<span class="blink-dot"></span> REANUDANDO CHECKPOINT [${data.target_index}/${data.total_targets}]`;
                 } else if (data.phase === 'VALIDATING_INDEX') {
                     statusInd.innerHTML = `<span class="blink-dot"></span> VALIDANDO ÍNDICE [${data.target_index}/${data.total_targets}]`;
                 } else {
-                    statusInd.innerHTML = `<span class="blink-dot"></span> MFT ENGINE: ARMED`;
+                    statusInd.innerHTML = `<span class="blink-dot"></span> RADAR ACTIVO`;
                 }
             }
         }
@@ -46,6 +50,18 @@ async function updateHudStatus() {
 }
 updateHudStatus();
 setInterval(updateHudStatus, 2000);
+
+// Botón superior del Radar (estilo pulsador Toriyama: cambia zoom de cuadrícula y dispara ping)
+if (radarTopBtn) {
+    radarTopBtn.addEventListener('click', () => {
+        zoomLevel = (zoomLevel % 3) + 1;
+        pingWaveRadius = 8;
+        pingActive = true;
+        if (sweepStatusEl) {
+            sweepStatusEl.textContent = zoomLevel === 1 ? 'ACTIVO (1X)' : zoomLevel === 2 ? 'AMPLIADO (2X)' : 'DETALLE (3X)';
+        }
+    });
+}
 
 // Botones de Modo
 document.querySelectorAll('.mode-btn').forEach(btn => {
@@ -60,66 +76,65 @@ document.querySelectorAll('.mode-btn').forEach(btn => {
 // Reloj HUD
 setInterval(() => {
     const now = new Date();
-    hudClock.textContent = now.toTimeString().split(' ')[0] + '.' + String(now.getMilliseconds()).padStart(3, '0').slice(0, 2);
-}, 80);
+    hudClock.textContent = now.toTimeString().split(' ')[0];
+}, 500);
 
-// Base de datos de demostración conectada con las crates de Dragon Radar Tool
+// Dataset demo cuando se previsualiza sin servidor HTTP activo
 const mockDataset = [
-    { name: 'ntfs.rs', path: 'crates/dragon-mft/src/ntfs.rs', badge: 'RUST', size: '10.2 KB', score: 2.58, type: 'code', snippet: 'DeviceIoControl(handle, FSCTL_ENUM_USN_DATA, ...);' },
-    { name: 'fallback.rs', path: 'crates/dragon-mft/src/fallback.rs', badge: 'RUST', size: '3.4 KB', score: 2.10, type: 'code', snippet: 'jwalk::WalkDir::new(&root_path).skip_hidden(false)...' },
-    { name: 'lib.rs', path: 'crates/dragon-mft/src/lib.rs', badge: 'RUST', size: '4.1 KB', score: 1.84, type: 'code', snippet: 'pub struct UnifiedScanner; scan_volume_mft(volume)...' },
-    { name: 'Cargo.toml', path: 'Cargo.toml', badge: 'TOML', size: '1.2 KB', score: 1.65, type: 'config', snippet: '[workspace] members = ["crates/dragon-core", "dragon-mft"...]' },
-    { name: 'main.rs', path: 'crates/dragon-cli/src/main.rs', badge: 'CLI', size: '5.8 KB', score: 1.45, type: 'code', snippet: 'Commands::Scan { target, limit } => UnifiedScanner::scan(&target)...' },
-    { name: 'lib.rs', path: 'crates/dragon-storage/src/lib.rs', badge: 'STORAGE', size: '3.8 KB', score: 1.30, type: 'db', snippet: 'pub struct DragonStorage { db: redb::Database }...' },
-    { name: 'lib.rs', path: 'crates/dragon-index/src/lib.rs', badge: 'INDEX', size: '4.9 KB', score: 1.15, type: 'search', snippet: 'pub struct DragonIndexEngine { index: TantivyIndex }...' },
-    { name: 'main.rs', path: 'crates/dragon-service/src/main.rs', badge: 'SERVICE', size: '3.1 KB', score: 1.05, type: 'ipc', snippet: 'DEFAULT_PIPE_NAME = r"\\\\.\\pipe\\dragon_radar_mft"...' },
-    { name: 'dragon_radar_architecture.md', path: 'docs/dragon_radar_architecture.md', badge: 'DOC', size: '24.5 KB', score: 0.95, type: 'doc', snippet: '# Dragon Radar Tool: Arquitectura Técnica y Plan de Construcción...' },
-    { name: 'dragon.exe', path: 'target/release/dragon.exe', badge: 'BIN', size: '18.4 MB', score: 0.85, type: 'binary', snippet: '[Binario Nativo Win32/x64 compilado con optimización L3]' }
+    { name: 'contrato_2026.pdf', path: 'Documents/contrato_2026.pdf', badge: 'PDF', size: '420 KB', score: '980.0', snippet: 'Documento PDF de ejemplo indexado por nombre y contenido.' },
+    { name: 'logo_capsule.svg', path: 'Design/logo_capsule.svg', badge: 'VECTOR', size: '34 KB', score: '710.0', snippet: 'Archivo vectorial indexado por nombre únicamente.' },
+    { name: 'dragon_radar.rs', path: 'crates/dragon-cli/src/main.rs', badge: 'RUST', size: '14 KB', score: '640.0', snippet: 'Código fuente principal del radar híbrido.' },
+    { name: 'intro_anime.mp4', path: 'Videos/intro_anime.mp4', badge: 'VIDEO', size: '48.2 MB', score: '520.0', snippet: 'Archivo multimedia indexado por nombre únicamente.' }
 ];
 
-// Generar coordenadas polares aleatorias consistentes basadas en el nombre
-function generateBlipCoordinates(item, index, total) {
-    let hash = 0;
-    for (let i = 0; i < item.name.length; i++) {
-        hash = (hash << 5) - hash + item.name.charCodeAt(i);
-        hash |= 0;
+// Generar coordenadas consistentes estilo Esferas del Dragón en la cuadrícula
+function generateBlipCoordinates(item, index) {
+    const str = item.path || item.name;
+    let hash = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+        hash ^= str.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
     }
-    const angle = Math.abs(hash % 360) * (Math.PI / 180);
-    // Radio entre 0.2 y 0.88 del centro
-    const radiusNorm = 0.2 + (Math.abs((hash >> 3) % 68) / 100);
+    const angle = (Math.abs(hash % 360)) * (Math.PI / 180);
+    // Las primeras coincidencias (mayor relevancia) aparecen más cerca del triángulo central
+    const tierRadius = 0.22 + Math.min(index, 12) * 0.045;
+    const jitter = (Math.abs((hash >> 5) % 14)) / 100;
+    const radiusNorm = Math.min(0.84, tierRadius + jitter);
     return {
         angle,
         radiusNorm,
         item,
         index,
-        pingIntensity: 1.0
+        bx: 0,
+        by: 0
     };
 }
 
-// Búsqueda y filtrado reactivo conectado a la API de Dragon Radar
+let searchTimer = null;
 async function performSearch(query) {
     const q = query.trim();
     let results = [];
+    let usedApi = false;
 
     if (q) {
         try {
             const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&mode=${currentMode}&limit=25`);
             if (res.ok) {
                 const apiResults = await res.json();
-                if (Array.isArray(apiResults) && apiResults.length > 0) {
+                if (Array.isArray(apiResults)) {
                     results = apiResults;
+                    usedApi = true;
                 }
             }
         } catch (_) {}
     }
 
-    // Si la API no retorna resultados o estamos en modo estático, fallback local
-    if (results.length === 0) {
+    if (!usedApi && (!q || results.length === 0)) {
         const lower = q.toLowerCase();
         if (!lower) {
-            results = mockDataset.slice(0, 6);
+            results = mockDataset;
         } else {
-            results = mockDataset.filter(item => 
+            results = mockDataset.filter(item =>
                 item.name.toLowerCase().includes(lower) ||
                 item.path.toLowerCase().includes(lower) ||
                 item.snippet.toLowerCase().includes(lower)
@@ -128,21 +143,29 @@ async function performSearch(query) {
     }
 
     currentResults = results;
-
-    // Actualizar blips en el radar
-    radarBlips = results.map((item, idx) => generateBlipCoordinates(item, idx, results.length));
+    radarBlips = results.map((item, idx) => generateBlipCoordinates(item, idx));
     blipCountEl.textContent = results.length;
     selectedIndex = results.length > 0 ? 0 : -1;
 
+    pingWaveRadius = 10;
+    pingActive = results.length > 0;
+
     renderResults(results);
+}
+
+function getBadgeClass(badge) {
+    if (['PDF', 'WORD', 'EXCEL', 'PPTX', 'EBOOK', 'DOC', 'RUST', 'JS', 'CODE'].includes(badge)) return '';
+    if (['VECTOR', 'DESIGN', 'CAD/3D', 'IMG'].includes(badge)) return 'badge-amber';
+    if (['VIDEO', 'AUDIO', 'MEDIA'].includes(badge)) return 'badge-sky';
+    return 'badge-gray';
 }
 
 function renderResults(results) {
     if (results.length === 0) {
         resultsContainer.innerHTML = `
             <div class="empty-state">
-                <p class="empty-title">SIN SEÑAL EN ESTA FRECUENCIA</p>
-                <p class="empty-subtitle">No se detectaron coincidencias para el término buscado</p>
+                <p class="empty-title">SIN SEÑAL EN EL RADAR</p>
+                <p class="empty-subtitle">No se detectaron archivos para esta consulta</p>
             </div>
         `;
         return;
@@ -150,19 +173,18 @@ function renderResults(results) {
 
     resultsContainer.innerHTML = results.map((item, idx) => `
         <div class="result-row ${idx === selectedIndex ? 'selected' : ''}" data-index="${idx}">
-            <div class="result-badge ${item.badge === 'RUST' || item.badge === 'SERVICE' ? '' : 'badge-amber'}">${item.badge}</div>
+            <div class="result-badge ${getBadgeClass(item.badge)}">${item.badge}</div>
             <div class="result-details">
                 <div class="result-filename">${item.name}</div>
                 <div class="result-path">${item.path}</div>
             </div>
             <div class="result-meta">
                 <div>${item.size}</div>
-                <div style="font-size: 9px; color: #5c8c67;">Score: ${item.score}</div>
+                <div class="result-score-sub">N.${idx + 1} · ${item.score}</div>
             </div>
         </div>
     `).join('');
 
-    // Listeners de clics
     document.querySelectorAll('.result-row').forEach(row => {
         row.addEventListener('click', () => {
             const idx = parseInt(row.dataset.index);
@@ -190,7 +212,7 @@ function selectResult(index) {
 
 async function openQuickLook(item) {
     modalTitle.textContent = `VISTA RÁPIDA: ${item.path}`;
-    modalCodePreview.textContent = `// Conectando con el motor de extracción Dragon Radar...\n// Archivo: ${item.path}`;
+    modalCodePreview.textContent = `// Extrayendo vista previa de ${item.path}...`;
     quickLookModal.classList.add('open');
 
     try {
@@ -198,18 +220,16 @@ async function openQuickLook(item) {
         if (res.ok) {
             const data = await res.json();
             if (data.success && data.content) {
-                modalCodePreview.textContent = `// Formato detectado: ${data.format} | ${data.content.length} caracteres extraídos\n\n${data.content}`;
+                modalCodePreview.textContent = `// Formato: ${data.format} | ${data.content.length} caracteres\n\n${data.content}`;
                 return;
             }
         }
     } catch (_) {}
 
-    modalCodePreview.textContent = `// Ruta del archivo: ${item.path}
-// Tamaño: ${item.size} | Relevancia: ${item.score}
+    modalCodePreview.textContent = `// Archivo: ${item.path}
+// Tamaño: ${item.size} | Puntuación: ${item.score}
 
-${item.snippet}
-
-[Contenido indexado en motor Dragon Radar (Tantivy / Redb / Model2Vec)]`;
+${item.snippet}`;
 }
 
 modalCloseBtn.addEventListener('click', () => quickLookModal.classList.remove('open'));
@@ -217,97 +237,166 @@ quickLookModal.addEventListener('click', (e) => {
     if (e.target === quickLookModal) quickLookModal.classList.remove('open');
 });
 
-// Renderizado del Radar Canvas (Canvas 2D)
-function drawRadar() {
-    const width = canvas.width;
-    const height = canvas.height;
-    const cx = width / 2;
-    const cy = height / 2;
-    const maxRadius = width / 2 - 8;
+// Clic directo sobre los blips del radar Canvas
+canvas.addEventListener('click', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const clickX = (e.clientX - rect.left) * scaleX;
+    const clickY = (e.clientY - rect.top) * scaleY;
 
-    // Limpiar con leve desvanecimiento para estela de radar
-    ctx.fillStyle = 'rgba(4, 12, 6, 0.25)';
-    ctx.fillRect(0, 0, width, height);
-
-    // Círculos concéntricos de alcance
-    ctx.strokeStyle = 'rgba(0, 255, 102, 0.25)';
-    ctx.lineWidth = 1;
-    for (let r = 0.25; r <= 1.0; r += 0.25) {
-        ctx.beginPath();
-        ctx.arc(cx, cy, maxRadius * r, 0, Math.PI * 2);
-        ctx.stroke();
+    let bestIdx = -1;
+    let bestDist = 22;
+    radarBlips.forEach((b, idx) => {
+        const d = Math.hypot(clickX - b.bx, clickY - b.by);
+        if (d < bestDist) {
+            bestDist = d;
+            bestIdx = idx;
+        }
+    });
+    if (bestIdx >= 0) {
+        selectResult(bestIdx);
     }
+});
 
-    // Dibujar línea de barrido rotatorio
-    sweepAngle += sweepSpeed;
-    if (sweepAngle >= Math.PI * 2) sweepAngle -= Math.PI * 2;
+// Dibujo Anime del Radar (Fiel a radar modelo.webp: fondo verde, cuadrícula cuadrada oscura, triángulo rojo central, blips luminosos con número)
+function drawRadar() {
+    const w = canvas.width;
+    const h = canvas.height;
+    const cx = w / 2;
+    const cy = h / 2;
+    const maxRadius = w / 2 - 4;
 
-    const sweepX = cx + Math.cos(sweepAngle) * maxRadius;
-    const sweepY = cy + Math.sin(sweepAngle) * maxRadius;
+    pulsePhase += 0.06;
 
-    const gradient = ctx.createRadialGradient(cx, cy, 0, cx, cy, maxRadius);
-    gradient.addColorStop(0, 'rgba(0, 255, 102, 0.3)');
-    gradient.addColorStop(1, 'rgba(0, 255, 102, 0.0)');
+    // 1. Fondo verde esmeralda anime con ligero degradado cel-shading
+    const bgGrad = ctx.createRadialGradient(cx - 40, cy - 45, 20, cx, cy, maxRadius);
+    bgGrad.addColorStop(0, '#0E8E1E');
+    bgGrad.addColorStop(0.7, '#086C14');
+    bgGrad.addColorStop(1, '#05510D');
+    ctx.fillStyle = bgGrad;
+    ctx.fillRect(0, 0, w, h);
 
+    // 2. Cuadrícula ortogonal clásica de Toriyama (como en radar modelo.webp)
+    const cells = zoomLevel === 1 ? 8 : zoomLevel === 2 ? 12 : 6;
+    const step = w / cells;
     ctx.save();
+    ctx.strokeStyle = '#032908';
+    ctx.lineWidth = 2.2;
     ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.arc(cx, cy, maxRadius, sweepAngle - 0.4, sweepAngle);
-    ctx.closePath();
-    ctx.fillStyle = 'rgba(0, 255, 102, 0.15)';
-    ctx.fill();
+    for (let i = 1; i < cells; i++) {
+        const pos = Math.round(i * step) + 0.5;
+        // Línea vertical
+        ctx.moveTo(pos, 0);
+        ctx.lineTo(pos, h);
+        // Línea horizontal
+        ctx.moveTo(0, pos);
+        ctx.lineTo(w, pos);
+    }
+    ctx.stroke();
 
-    // Línea frontal de barrido
+    // Borde interno sutil del cristal del radar
     ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.lineTo(sweepX, sweepY);
-    ctx.strokeStyle = '#00ff66';
-    ctx.lineWidth = 2;
-    ctx.shadowColor = '#00ff66';
-    ctx.shadowBlur = 8;
+    ctx.arc(cx, cy, maxRadius - 2, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(0, 20, 4, 0.55)';
+    ctx.lineWidth = 4;
     ctx.stroke();
     ctx.restore();
 
-    // Dibujar Blips (Dragon Balls / Archivos detectados)
-    radarBlips.forEach((blip, idx) => {
-        const blipRadius = blip.radiusNorm * maxRadius;
-        const bx = cx + Math.cos(blip.angle) * blipRadius;
-        const by = cy + Math.sin(blip.angle) * blipRadius;
-
-        // Si la aguja de barrido pasa por el blip, intensificar el pulso
-        const angleDiff = Math.abs(sweepAngle - blip.angle);
-        if (angleDiff < 0.1 || angleDiff > Math.PI * 2 - 0.1) {
-            blip.pingIntensity = 1.0;
-        } else {
-            blip.pingIntensity = Math.max(0.2, blip.pingIntensity - 0.008);
+    // 3. Onda expansiva anime cuando se pulsa el botón o hay búsqueda
+    if (pingActive) {
+        pingWaveRadius += 5.5;
+        const alpha = Math.max(0, 1 - pingWaveRadius / maxRadius);
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(cx, cy, pingWaveRadius, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(210, 255, 140, ${alpha * 0.75})`;
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        ctx.restore();
+        if (pingWaveRadius >= maxRadius) {
+            pingActive = false;
         }
+    }
+
+    // 4. Blips luminosos amarillos/blancos con número anime (ej. • 1, • 2, • 4)
+    const blinkScale = 0.88 + 0.12 * Math.sin(pulsePhase * 1.4);
+
+    radarBlips.slice(0, 18).forEach((blip, idx) => {
+        const r = blip.radiusNorm * (maxRadius - 24);
+        const bx = cx + Math.cos(blip.angle) * r;
+        const by = cy + Math.sin(blip.angle) * r;
+        blip.bx = bx;
+        blip.by = by;
 
         const isSelected = idx === selectedIndex;
+        const baseRadius = (isSelected ? 10.5 : 7.5) * blinkScale;
+
         ctx.save();
 
+        // Anillo anime de mira alrededor del blip seleccionado
         if (isSelected) {
-            // Anillo de enfoque táctico alrededor del blip seleccionado
             ctx.beginPath();
-            ctx.arc(bx, by, 12, 0, Math.PI * 2);
-            ctx.strokeStyle = '#ffaa00';
-            ctx.lineWidth = 1.5;
-            ctx.setLineDash([3, 3]);
+            ctx.arc(bx, by, 17, 0, Math.PI * 2);
+            ctx.strokeStyle = '#FFD028';
+            ctx.lineWidth = 2.5;
+            ctx.setLineDash([5, 4]);
             ctx.stroke();
             ctx.setLineDash([]);
         }
 
-        // Blip principal (Dragon Ball ámbar brillante)
+        // Halo luminoso amarillo característico del anime
+        ctx.shadowColor = '#FFEE44';
+        ctx.shadowBlur = isSelected ? 18 : 12;
+
         ctx.beginPath();
-        ctx.arc(bx, by, isSelected ? 6 : 4, 0, Math.PI * 2);
-        ctx.fillStyle = isSelected 
-            ? '#ffcc00' 
-            : `rgba(255, 170, 0, ${blip.pingIntensity})`;
-        ctx.shadowColor = '#ffaa00';
-        ctx.shadowBlur = isSelected ? 12 : 6;
+        ctx.arc(bx, by, baseRadius, 0, Math.PI * 2);
+        ctx.fillStyle = isSelected ? '#FFFDF0' : '#FFFFB8';
         ctx.fill();
+
+        // Contorno del blip
+        ctx.shadowBlur = 0;
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = '#E6B800';
+        ctx.stroke();
+
+        // Etiqueta numérica anime al lado superior derecho del punto (como el "4" en radar modelo.webp)
+        if (idx < 9 || isSelected) {
+            ctx.font = `700 ${isSelected ? 15 : 13}px 'Fredoka', sans-serif`;
+            ctx.lineWidth = 3;
+            ctx.strokeStyle = '#032908';
+            const label = String(idx + 1);
+            ctx.strokeText(label, bx + 11, by - 7);
+            ctx.fillStyle = isSelected ? '#FFE44D' : '#FFF8A6';
+            ctx.fillText(label, bx + 11, by - 7);
+        }
 
         ctx.restore();
     });
+
+    // 5. Triángulo rojo central apuntando hacia arriba (icono exacto del Radar del Dragón)
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.beginPath();
+    ctx.moveTo(0, -13);
+    ctx.lineTo(11, 9);
+    ctx.lineTo(-11, 9);
+    ctx.closePath();
+    ctx.fillStyle = '#EE1B1B';
+    ctx.fill();
+    ctx.lineWidth = 2.2;
+    ctx.strokeStyle = '#4A0404';
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+    ctx.restore();
+
+    // 6. Reflejo sutil de cristal anime en la esquina superior izquierda
+    ctx.save();
+    ctx.beginPath();
+    ctx.ellipse(cx - 65, cy - 75, 46, 16, -0.65, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.09)';
+    ctx.fill();
+    ctx.restore();
 
     requestAnimationFrame(drawRadar);
 }
@@ -341,8 +430,12 @@ window.addEventListener('keydown', (e) => {
     }
 });
 
-// Listener de Búsqueda
-searchInput.addEventListener('input', (e) => performSearch(e.target.value));
+// Listener de Búsqueda con debounce ligero (120ms)
+searchInput.addEventListener('input', (e) => {
+    const val = e.target.value;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => performSearch(val), 120);
+});
 
 // Iniciar radar y búsqueda inicial
 performSearch('');

@@ -15,11 +15,14 @@ pub enum DocumentFormat {
     Docx,
     Xlsx,
     Pptx,
+    OpenDocument,
+    Epub,
+    Rtf,
     TextOrCode,
     Unsupported,
 }
 
-/// Detecta el formato del documento a partir de su extensión.
+/// Detecta el formato de documento extraíble a partir de su extensión.
 pub fn detect_format<P: AsRef<Path>>(path: P) -> DocumentFormat {
     let p = path.as_ref();
     let ext = p
@@ -30,14 +33,22 @@ pub fn detect_format<P: AsRef<Path>>(path: P) -> DocumentFormat {
 
     match ext.as_str() {
         "pdf" => DocumentFormat::Pdf,
-        "docx" => DocumentFormat::Docx,
-        "xlsx" => DocumentFormat::Xlsx,
-        "pptx" => DocumentFormat::Pptx,
-        "txt" | "md" | "rs" | "py" | "js" | "ts" | "jsx" | "tsx" | "json" | "toml" | "yaml"
-        | "yml" | "html" | "css" | "xml" | "c" | "cpp" | "h" | "hpp" | "cs" | "java" | "go"
-        | "sql" | "sh" | "ps1" | "bat" | "log" | "ini" | "env" | "csv" | "tsv" => {
-            DocumentFormat::TextOrCode
-        }
+        "docx" | "docm" | "dotx" | "dotm" => DocumentFormat::Docx,
+        "xlsx" | "xlsm" => DocumentFormat::Xlsx,
+        "pptx" | "pptm" | "ppsx" => DocumentFormat::Pptx,
+        "odt" | "ott" | "ods" | "odp" => DocumentFormat::OpenDocument,
+        "epub" => DocumentFormat::Epub,
+        "rtf" => DocumentFormat::Rtf,
+        "txt" | "md" | "markdown" | "rst" | "adoc" | "tex" | "org" | "log"
+        | "json" | "jsonl" | "ndjson" | "xml" | "yaml" | "yml" | "toml" | "ini" | "cfg"
+        | "conf" | "env" | "properties" | "sql" | "graphql" | "proto" | "csv" | "tsv"
+        | "html" | "htm" | "xhtml" | "css" | "scss" | "sass" | "less"
+        | "js" | "mjs" | "cjs" | "ts" | "mts" | "jsx" | "tsx" | "vue" | "svelte" | "astro"
+        | "php" | "rs" | "py" | "pyw" | "ipynb" | "java" | "kt" | "kts" | "scala"
+        | "go" | "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" | "hxx" | "cs" | "fs" | "vb"
+        | "rb" | "pl" | "lua" | "r" | "dart" | "swift" | "m" | "mm"
+        | "sh" | "bash" | "zsh" | "fish" | "ps1" | "psm1" | "bat" | "cmd"
+        | "gradle" | "cmake" => DocumentFormat::TextOrCode,
         _ => DocumentFormat::Unsupported,
     }
 }
@@ -52,6 +63,9 @@ pub fn extract_content<P: AsRef<Path>>(path: P, max_bytes: usize) -> Result<Stri
         DocumentFormat::Docx => office::extract_docx_text(p, max_bytes),
         DocumentFormat::Xlsx => office::extract_xlsx_text(p, max_bytes),
         DocumentFormat::Pptx => office::extract_pptx_text(p, max_bytes),
+        DocumentFormat::OpenDocument => office::extract_opendocument_text(p, max_bytes),
+        DocumentFormat::Epub => office::extract_epub_text(p, max_bytes),
+        DocumentFormat::Rtf => office::extract_rtf_text(p, max_bytes),
         DocumentFormat::TextOrCode => text::extract_plain_text(p, max_bytes),
         DocumentFormat::Unsupported => Ok(String::new()),
     }

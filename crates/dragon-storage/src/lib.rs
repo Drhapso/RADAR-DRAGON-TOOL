@@ -3,7 +3,7 @@
 //! masivos, garantizando ACID y auto-reclamación eficiente de espacio en disco.
 
 use anyhow::{Context, Result};
-use dragon_core::FileRecord;
+use dragon_core::{classify_path, is_noisy_build_or_cache_path, FileCategory, FileRecord};
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -122,24 +122,130 @@ impl DragonStorage {
         Ok(files_table.len()? as usize)
     }
 
-    /// Busca registros de archivos por coincidencia de subcadena en el nombre (case-insensitive).
+    /// Busca registros de archivos por coincidencia de nombre ordenada por precisión.
     pub fn search_by_name(&self, query: &str, limit: usize) -> Result<Vec<FileRecord>> {
-        let q_lower = query.to_lowercase();
+        let ranked = self.search_by_name_ranked(query, None, limit)?;
+        Ok(ranked.into_iter().map(|(rec, _)| rec).collect())
+    }
+
+    /// Búsqueda de alta precisión por nombre y categoría funcional con puntuación multi-token.
+    pub fn search_by_name_ranked(
+        &self,
+        query: &str,
+        category_filter: Option<FileCategory>,
+        limit: usize,
+    ) -> Result<Vec<(FileRecord, f32)>> {
+        let q_lower = query.trim().to_lowercase();
+        if q_lower.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tokens: Vec<&str> = q_lower
+            .split(|c: char| c.is_whitespace() || c == '/' || c == '\\')
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let read_txn = self.db.begin_read()?;
         let files_table = read_txn.open_table(FILES_TABLE)?;
-        let mut results = Vec::with_capacity(limit);
+        let mut scored: Vec<(FileRecord, f32)> = Vec::new();
 
         for item in files_table.iter()? {
             let (_, val) = item?;
             let record: FileRecord = serde_json::from_slice(val.value())?;
-            if record.name.to_lowercase().contains(&q_lower) {
-                results.push(record);
-                if results.len() >= limit {
-                    break;
+
+            if record.is_directory && category_filter.is_some() {
+                continue;
+            }
+
+            let path_str = record
+                .path
+                .as_deref()
+                .map(|p| p.to_string_lossy())
+                .unwrap_or_default();
+
+            let cat = if record.is_directory {
+                FileCategory::SystemOrBinary
+            } else {
+                classify_path(&record.name)
+            };
+
+            if let Some(expected_cat) = category_filter {
+                if cat != expected_cat {
+                    continue;
                 }
             }
+
+            let name_lower = record.name.to_lowercase();
+            let path_lower = path_str.to_lowercase();
+
+            // Exigir que TODOS los tokens de búsqueda estén presentes en el nombre (o en ruta si hay varios)
+            let all_in_name = tokens.iter().all(|t| name_lower.contains(t));
+            let all_in_path = if all_in_name {
+                true
+            } else if tokens.len() > 1 {
+                tokens.iter().all(|t| path_lower.contains(t))
+            } else {
+                false
+            };
+
+            if !all_in_path {
+                continue;
+            }
+
+            let mut score = 0.0f32;
+            let stem_lower = Path::new(&record.name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_lowercase())
+                .unwrap_or_else(|| name_lower.clone());
+
+            if name_lower == q_lower || stem_lower == q_lower {
+                score += 1000.0;
+            } else if name_lower.starts_with(&q_lower) {
+                score += 450.0;
+            } else if name_lower.contains(&q_lower) {
+                score += 260.0;
+            }
+
+            if all_in_name {
+                score += 180.0;
+                for tok in &tokens {
+                    if is_word_boundary_match(&name_lower, tok) {
+                        score += 90.0;
+                    }
+                }
+            } else {
+                score += 40.0;
+            }
+
+            if !record.is_directory {
+                score += 30.0;
+                score += match cat {
+                    FileCategory::Document => 60.0,
+                    FileCategory::ImageOrDesign => 55.0,
+                    FileCategory::Media => 50.0,
+                    FileCategory::SystemOrBinary => 0.0,
+                };
+            } else {
+                // Penalización leve a carpetas frente a archivos reales salvo coincidencia exacta
+                score -= 20.0;
+            }
+
+            if is_noisy_build_or_cache_path(&path_lower) {
+                score -= 180.0;
+            }
+
+            // Desempate: nombres más cortos y precisos suben primero
+            score -= (name_lower.len() as f32) * 0.25;
+
+            scored.push((record, score));
         }
-        Ok(results)
+
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(limit);
+        Ok(scored)
     }
 
     /// Guarda una configuración o estado clave-valor.
@@ -243,5 +349,69 @@ impl DragonStorage {
     pub fn save_checkpoint(&self, cp: &CheckpointState) -> Result<()> {
         let json_str = serde_json::to_string(cp)?;
         self.set_setting(CHECKPOINT_SETTING_KEY, &json_str)
+    }
+}
+
+fn is_word_boundary_match(haystack: &str, needle: &str) -> bool {
+    if let Some(pos) = haystack.find(needle) {
+        if pos == 0 {
+            return true;
+        }
+        if let Some(prev) = haystack[..pos].chars().next_back() {
+            return matches!(prev, ' ' | '_' | '-' | '.' | '(' | '[' | '/' | '\\');
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn ranked_name_search_filters_categories_and_penalizes_cache() {
+        let tmp = std::env::temp_dir().join(format!("dragon_storage_test_{}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let storage = DragonStorage::open(&tmp).unwrap();
+
+        let make_rec = |id: u64, name: &str, path: &str| FileRecord {
+            id,
+            parent_id: 0,
+            name: name.to_string(),
+            path: Some(PathBuf::from(path)),
+            size: 1024,
+            attributes: 0,
+            modified_ms: 1000,
+            is_directory: false,
+        };
+
+        storage
+            .insert_batch(&[
+                make_rec(1, "contrato.pdf", r"C:\Users\Drhapso\Documents\contrato.pdf"),
+                make_rec(2, "contrato_copia_backup_2025.pdf", r"C:\Users\Drhapso\Documents\target\debug\contrato_copia_backup_2025.pdf"),
+                make_rec(3, "logo_empresa.svg", r"C:\Users\Drhapso\Documents\logo_empresa.svg"),
+                make_rec(4, "trailer_evento.mp4", r"C:\Users\Drhapso\Videos\trailer_evento.mp4"),
+                make_rec(5, "kernel_driver.dll", r"C:\Custom\kernel_driver.dll"),
+            ])
+            .unwrap();
+
+        let docs = storage.search_by_name_ranked("contrato", Some(FileCategory::Document), 10).unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].0.name, "contrato.pdf");
+
+        let design = storage.search_by_name_ranked("logo svg", Some(FileCategory::ImageOrDesign), 10).unwrap();
+        assert_eq!(design.len(), 1);
+        assert_eq!(design[0].0.name, "logo_empresa.svg");
+
+        let media = storage.search_by_name_ranked("trailer", Some(FileCategory::Media), 10).unwrap();
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].0.name, "trailer_evento.mp4");
+
+        let sys = storage.search_by_name_ranked("kernel", Some(FileCategory::SystemOrBinary), 10).unwrap();
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0].0.name, "kernel_driver.dll");
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

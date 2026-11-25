@@ -20,10 +20,15 @@ echo        Para cerrar el radar, simplemente cierra esta ventana.
 echo ======================================================================
 echo.
 
-if exist "dragon.exe" (
+if exist "target\release\dragon.exe" (
+    copy /Y "target\release\dragon.exe" "dragon.exe" >nul 2>&1
+    if exist "dragon.exe" (
+        target\release\dragon.exe ui
+    ) else (
+        target\release\dragon.exe ui
+    )
+) else if exist "dragon.exe" (
     dragon.exe ui
-) else if exist "target\release\dragon.exe" (
-    target\release\dragon.exe ui
 ) else (
     echo [ERROR] No se encontro dragon.exe. Por favor compila con 'cargo build --release'.
     pause

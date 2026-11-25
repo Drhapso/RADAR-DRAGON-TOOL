@@ -3,88 +3,122 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dragon Radar Tool - Tactical Search HUD</title>
+    <title>Dragon Radar Tool - Anime Edition</title>
     <link rel="stylesheet" href="styles.css">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Chakra+Petch:wght@600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 </head>
-<body class="crt-screen">
-    <div class="scanlines"></div>
-    <div class="vignette"></div>
+<body class="anime-world">
+    <!-- Cielo estilo Dragon Ball (Toriyama clouds) -->
+    <div class="anime-sky-layer" aria-hidden="true">
+        <div class="anime-cloud cloud-1"></div>
+        <div class="anime-cloud cloud-2"></div>
+        <div class="anime-cloud cloud-3"></div>
+    </div>
 
     <div class="radar-container">
-        <!-- Barra de Estado Superior -->
+        <!-- Barra Superior Estilo Capsule Corp / Anime -->
         <header class="hud-header">
             <div class="header-left">
-                <span class="radar-logo">⚡ DRAGON RADAR <span class="version-tag">v0.1.0-MFT</span></span>
+                <div class="dragon-emblem" aria-hidden="true">
+                    <svg viewBox="0 0 40 40" width="34" height="34">
+                        <circle cx="20" cy="20" r="18" fill="#FF981A" stroke="#141414" stroke-width="3"/>
+                        <path d="M 8 15 A 13 13 0 0 1 24 6" fill="none" stroke="#FFF6C9" stroke-width="3" stroke-linecap="round"/>
+                        <polygon points="20,10 22.4,16.5 29.2,16.8 23.8,21 25.7,27.6 20,23.8 14.3,27.6 16.2,21 10.8,16.8 17.6,16.5" fill="#D91E18" stroke="#141414" stroke-width="1.2"/>
+                    </svg>
+                </div>
+                <span class="radar-logo">DRAGON RADAR <span class="version-tag">CAPSULE EDITION</span></span>
                 <span class="status-indicator" id="statusIndicator"><span class="blink-dot"></span> MFT ENGINE: ARMED</span>
             </div>
             <div class="header-right">
                 <span class="hud-clock" id="hudClock">00:00:00</span>
-                <span class="db-stats" id="dbStats">INDEX: 106,066 ENTRIES</span>
+                <span class="db-stats" id="dbStats">REDB: 0 | AI: 0 VECTORS</span>
             </div>
         </header>
 
-        <!-- Contenedor Principal: Radar a la izquierda, Feed a la derecha -->
+        <!-- Cuerpo Principal: Dispositivo Radar a la izquierda, Panel Manga de Resultados a la derecha -->
         <main class="hud-body">
-            <!-- Sección del Radar Circular -->
+            <!-- Dispositivo Físico Dragon Radar (Basado en radar modelo.webp) -->
             <section class="radar-visualizer-panel">
-                <div class="radar-frame">
-                    <canvas id="radarCanvas" width="360" height="360"></canvas>
-                    <div class="radar-hud-overlay">
-                        <div class="crosshair-h"></div>
-                        <div class="crosshair-v"></div>
-                        <span class="range-ring r1">25%</span>
-                        <span class="range-ring r2">50%</span>
-                        <span class="range-ring r3">75%</span>
-                        <span class="range-ring r4">MAX</span>
+                <div class="device-title-strip">
+                    <span>RADAR DE BÚSQUEDA</span>
+                    <span class="tip-pill" title="Haz clic en el botón superior del radar para hacer zoom / ping">CLICK BOTÓN: ZOOM</span>
+                </div>
+
+                <div class="dragon-radar-device">
+                    <!-- Botón Superior Mecánico (Pulsador Toriyama) -->
+                    <button id="radarTopBtn" class="radar-plunger-btn" title="Pulsar botón del radar (Ping & Zoom)">
+                        <svg viewBox="0 0 120 74" width="104" height="64">
+                            <!-- Cuello blanco curvo de la carcasa -->
+                            <path d="M 24 72 C 29 52, 37 44, 42 39 L 78 39 C 83 44, 91 52, 96 72 Z" fill="#F2F4EE" stroke="#141414" stroke-width="4" stroke-linejoin="round"/>
+                            <path d="M 70 41 C 76 47, 84 55, 89 70 L 94 70 C 89 53, 81 45, 76 41 Z" fill="#C7CFC4"/>
+                            <!-- Tallo del pulsador -->
+                            <rect x="43" y="29" width="34" height="12" rx="4" fill="#D5DDD2" stroke="#141414" stroke-width="3.5"/>
+                            <!-- Cúpula superior del botón -->
+                            <path d="M 32 30 C 32 10, 88 10, 88 30 Z" fill="#F7F8F4" stroke="#141414" stroke-width="4" stroke-linejoin="round"/>
+                            <!-- Sombra cel-shading del botón -->
+                            <path d="M 55 15 C 74 16, 84 23, 85 28 L 35 28 C 48 27, 68 23, 55 15 Z" fill="#C8D0C5"/>
+                            <!-- Brillo especular anime -->
+                            <path d="M 40 22 C 42 16, 52 14, 60 15" fill="none" stroke="#FFFFFF" stroke-width="3.5" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+
+                    <!-- Carcasa Circular Blanca Estilo Akira Toriyama -->
+                    <div class="radar-shell">
+                        <div class="radar-shell-shadow"></div>
+                        <div class="radar-shell-highlight"></div>
+                        <div class="radar-bezel-inner">
+                            <div class="radar-frame">
+                                <canvas id="radarCanvas" width="380" height="380"></canvas>
+                            </div>
+                        </div>
                     </div>
                 </div>
+
                 <div class="radar-controls">
-                    <div class="sweep-speed-display">SWEEP: <span id="sweepStatus">ACTIVE (120 RPM)</span></div>
-                    <div class="detected-count">BLIPS DETECTED: <span id="blipCount" class="highlight-amber">0</span></div>
+                    <div class="sweep-speed-display">ESCALA: <span id="sweepStatus">ACTIVO (1X)</span></div>
+                    <div class="detected-count">ESFERAS / ARCHIVOS: <span id="blipCount" class="highlight-amber">0</span></div>
                 </div>
             </section>
 
-            <!-- Sección de Búsqueda y Resultados -->
+            <!-- Panel Derecho: Buscador y Feed Estilo Viñeta Anime -->
             <section class="search-feed-panel">
-                <!-- Caja de Entrada Táctica -->
                 <div class="search-box-wrapper">
-                    <span class="prompt-symbol">&gt;&gt;</span>
-                    <input type="text" id="searchInput" class="tactical-input" placeholder="BUSCAR ARCHIVOS O CONTENIDO..." autofocus autocomplete="off" spellcheck="false">
+                    <span class="prompt-symbol">▶</span>
+                    <input type="text" id="searchInput" class="tactical-input" placeholder="BUSCAR ARCHIVOS, DOCUMENTOS, MULTIMEDIA O DISEÑO..." autofocus autocomplete="off" spellcheck="false">
                     <div class="search-mode-toggles">
                         <button class="mode-btn active" data-mode="all">HÍBRIDO</button>
-                        <button class="mode-btn" data-mode="filename">NOMBRE</button>
+                        <button class="mode-btn" data-mode="documents">DOCS</button>
+                        <button class="mode-btn" data-mode="media">MULTIMEDIA</button>
+                        <button class="mode-btn" data-mode="design">DISEÑO/IMG</button>
                         <button class="mode-btn" data-mode="content">CONTENIDO</button>
-                        <button class="mode-btn" data-mode="mft">MFT RAW</button>
+                        <button class="mode-btn" data-mode="filename">NOMBRE/SYS</button>
                     </div>
                 </div>
 
-                <!-- Lista de Resultados -->
                 <div class="results-container" id="resultsContainer">
                     <div class="empty-state">
-                        <p class="empty-title">RADAR EN ESPERA DE FRECUENCIA</p>
-                        <p class="empty-subtitle">Escribe un término para rastrear en disco (ej. <code>DeviceIoControl</code>, <code>ntfs</code>, <code>Cargo.toml</code>)</p>
+                        <p class="empty-title">RADAR LISTO PARA RASTREAR</p>
+                        <p class="empty-subtitle">Escribe el nombre de un archivo o el texto dentro de tus documentos</p>
                     </div>
                 </div>
 
-                <!-- Barra de Atajos Inferior -->
                 <footer class="hud-footer">
                     <div class="shortcut-tip"><kbd>↑</kbd><kbd>↓</kbd> NAVEGAR</div>
-                    <div class="shortcut-tip"><kbd>ENTER</kbd> ABRIR ARCHIVO</div>
+                    <div class="shortcut-tip"><kbd>ENTER</kbd> ABRIR UBICACIÓN</div>
                     <div class="shortcut-tip"><kbd>SPACE</kbd> VISTA RÁPIDA</div>
-                    <div class="shortcut-tip"><kbd>ALT+SPACE</kbd> OCULTAR RADAR</div>
+                    <div class="shortcut-tip"><kbd>CLICK BLIP</kbd> ENFOCAR</div>
                 </footer>
             </section>
         </main>
     </div>
 
-    <!-- Modal de Vista Rápida (Quick Look) -->
+    <!-- Modal de Vista Rápida Estilo Ficha Capsule Corp -->
     <div class="quick-look-modal" id="quickLookModal">
         <div class="modal-content">
             <div class="modal-header">
-                <span class="modal-title" id="modalTitle">VISTA RÁPIDA DE ARTIFACTO</span>
+                <span class="modal-title" id="modalTitle">VISTA RÁPIDA DE ARCHIVO</span>
                 <button class="modal-close-btn" id="modalCloseBtn">&times;</button>
             </div>
             <div class="modal-body">

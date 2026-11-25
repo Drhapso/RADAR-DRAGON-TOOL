@@ -2,8 +2,9 @@
 //! Soporta compresión de bloques con LZ4, ranking BM25 y trigramas
 //! para búsquedas instantáneas dentro del contenido de documentos.
 
-use std::path::Path;
 use anyhow::{Context, Result};
+use dragon_core::{classify_path, is_noisy_build_or_cache_path, FileCategory};
+use std::path::Path;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::*;
@@ -110,19 +111,41 @@ impl DragonIndexEngine {
         Ok(())
     }
 
-    /// Ejecuta una consulta sobre el nombre y el contenido usando BM25.
+    /// Ejecuta una consulta de alta precisión sobre documentos usando BM25 + conjunción por defecto + boost de nombre.
     pub fn search(&self, query_str: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        let trimmed = query_str.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let searcher = self.reader.searcher();
-        let query_parser = QueryParser::for_index(
+        let mut query_parser = QueryParser::for_index(
             &self.index,
             vec![self.field_filename, self.field_content],
         );
+        query_parser.set_field_boost(self.field_filename, 4.0);
+        query_parser.set_field_boost(self.field_content, 1.0);
+        query_parser.set_conjunction_by_default();
 
-        let query = query_parser.parse_query(query_str)?;
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(limit))?;
+        let (query, _errors) = query_parser.parse_query_lenient(trimmed);
+        let candidate_limit = (limit * 4).max(40);
+        let mut top_docs = searcher.search(&query, &TopDocs::with_limit(candidate_limit))?;
 
+        // Si una consulta multi-palabra con AND estricto no arroja resultados, relajar a OR ponderado
+        if top_docs.is_empty() && trimmed.split_whitespace().count() > 1 {
+            let mut relaxed_parser = QueryParser::for_index(
+                &self.index,
+                vec![self.field_filename, self.field_content],
+            );
+            relaxed_parser.set_field_boost(self.field_filename, 4.0);
+            let (relaxed_q, _) = relaxed_parser.parse_query_lenient(trimmed);
+            top_docs = searcher.search(&relaxed_q, &TopDocs::with_limit(candidate_limit))?;
+        }
+
+        let q_lower = trimmed.to_lowercase();
         let mut hits = Vec::with_capacity(top_docs.len());
-        for (score, doc_address) in top_docs {
+
+        for (raw_score, doc_address) in top_docs {
             let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
 
             let id = retrieved_doc.get_first(self.field_id).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -137,6 +160,22 @@ impl DragonIndexEngine {
                 .unwrap_or("")
                 .to_string();
 
+            // Garantizar que el motor de contenidos solo devuelva documentos conocidos
+            if classify_path(&path) != FileCategory::Document {
+                continue;
+            }
+
+            let mut score = raw_score;
+            let fn_lower = filename.to_lowercase();
+            if fn_lower == q_lower {
+                score *= 3.0;
+            } else if fn_lower.contains(&q_lower) {
+                score *= 1.8;
+            }
+            if is_noisy_build_or_cache_path(&path) {
+                score *= 0.25;
+            }
+
             hits.push(SearchHit {
                 id,
                 path,
@@ -145,6 +184,8 @@ impl DragonIndexEngine {
             });
         }
 
+        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(limit);
         Ok(hits)
     }
 }

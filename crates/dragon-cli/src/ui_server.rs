@@ -5,10 +5,10 @@
 
 use crate::indexer::{run_startup_auto_sync_and_validate, SharedRadarState};
 use anyhow::Result;
-use dragon_ai::HybridRanker;
+use dragon_core::{classify_path, is_noisy_build_or_cache_path, FileCategory};
 use dragon_extract::{detect_format, extract_content};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -215,16 +215,18 @@ async fn handle_connection(mut socket: TcpStream, state: Arc<SharedRadarState>) 
 }
 
 fn execute_search(state: &SharedRadarState, query: &str, mode: &str, limit: usize) -> serde_json::Value {
-    let mut output_items = Vec::new();
-
-    if query.trim().is_empty() {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
         return json!([]);
     }
 
+    let mut output_items = Vec::new();
+
     match mode {
         "filename" => {
-            if let Ok(records) = state.storage.search_by_name(query, limit) {
-                for rec in records {
+            // Búsqueda por nombre en todas las categorías (incluyendo sistema y binarios por nombre únicamente)
+            if let Ok(records) = state.storage.search_by_name_ranked(trimmed, None, limit) {
+                for (rec, score) in records {
                     let path_str = rec.path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
                     let badge = determine_badge(&path_str);
                     output_items.push(json!({
@@ -232,21 +234,62 @@ fn execute_search(state: &SharedRadarState, query: &str, mode: &str, limit: usiz
                         "path": path_str,
                         "badge": badge,
                         "size": format_file_size(rec.size),
-                        "score": "MFT/Redb",
-                        "snippet": format!("Archivo indexado en base de datos MFT redb. Tamaño: {}", format_file_size(rec.size))
+                        "score": format!("{:.0} (Nombre)", score),
+                        "snippet": format!("Coincidencia por nombre ({:?}). Tamaño: {}", classify_path(&path_str), format_file_size(rec.size))
+                    }));
+                }
+            }
+        }
+        "media" => {
+            // Multimedia (audio y video conocidos) -> únicamente por nombre
+            if let Ok(records) = state
+                .storage
+                .search_by_name_ranked(trimmed, Some(FileCategory::Media), limit)
+            {
+                for (rec, score) in records {
+                    let path_str = rec.path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                    let badge = determine_badge(&path_str);
+                    output_items.push(json!({
+                        "name": rec.name,
+                        "path": path_str,
+                        "badge": badge,
+                        "size": format_file_size(rec.size),
+                        "score": format!("{:.0} (Media)", score),
+                        "snippet": format!("Archivo multimedia indexado por nombre. Tamaño: {}", format_file_size(rec.size))
+                    }));
+                }
+            }
+        }
+        "design" => {
+            // Imágenes, vectores, CAD, 3D y archivos de diseño -> únicamente por nombre
+            if let Ok(records) = state
+                .storage
+                .search_by_name_ranked(trimmed, Some(FileCategory::ImageOrDesign), limit)
+            {
+                for (rec, score) in records {
+                    let path_str = rec.path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                    let badge = determine_badge(&path_str);
+                    output_items.push(json!({
+                        "name": rec.name,
+                        "path": path_str,
+                        "badge": badge,
+                        "size": format_file_size(rec.size),
+                        "score": format!("{:.0} (Diseño)", score),
+                        "snippet": format!("Archivo gráfico/vectorial/diseño indexado por nombre. Tamaño: {}", format_file_size(rec.size))
                     }));
                 }
             }
         }
         "content" => {
-            if let Ok(hits) = state.index_engine.search(query, limit) {
+            // Búsqueda estricta de contenido BM25 sobre Documentos conocidos
+            if let Ok(hits) = state.index_engine.search(trimmed, limit) {
                 for hit in hits {
                     let badge = determine_badge(&hit.path);
                     output_items.push(json!({
                         "name": hit.filename,
                         "path": hit.path,
                         "badge": badge,
-                        "size": "Indexed",
+                        "size": "Documento",
                         "score": format!("{:.2}", hit.score),
                         "snippet": format!("Coincidencia de contenido Tantivy BM25 con relevancia {:.2}", hit.score)
                     }));
@@ -254,10 +297,13 @@ fn execute_search(state: &SharedRadarState, query: &str, mode: &str, limit: usiz
             }
         }
         "semantic" => {
-            let q_vec = state.embedder.embed(query);
+            let q_vec = state.embedder.embed(trimmed);
             if let Ok(vs) = state.vector_store.read() {
-                let hits = vs.search(&q_vec, limit);
+                let hits = vs.search(&q_vec, limit * 2);
                 for hit in hits {
+                    if classify_path(&hit.path) != FileCategory::Document || hit.score < 0.22 {
+                        continue;
+                    }
                     let filename = Path::new(&hit.path)
                         .file_name()
                         .map(|f| f.to_string_lossy().to_string())
@@ -271,64 +317,148 @@ fn execute_search(state: &SharedRadarState, query: &str, mode: &str, limit: usiz
                         "score": format!("{:.1}%", hit.score * 100.0),
                         "snippet": hit.snippet
                     }));
-                }
-            }
-        }
-        _ => {
-            let mut seen_paths = HashSet::new();
-
-            // 1. Coincidencias directas por nombre de archivo en Redb
-            if let Ok(records) = state.storage.search_by_name(query, 10) {
-                for rec in records {
-                    let path_str = rec.path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-                    if seen_paths.insert(path_str.clone()) {
-                        let badge = determine_badge(&path_str);
-                        output_items.push(json!({
-                            "name": rec.name,
-                            "path": path_str,
-                            "badge": badge,
-                            "size": format_file_size(rec.size),
-                            "score": "1.00 (Nombre)",
-                            "snippet": format!("Coincidencia exacta por nombre de archivo en MFT/Redb. Tamaño: {}", format_file_size(rec.size))
-                        }));
+                    if output_items.len() >= limit {
+                        break;
                     }
                 }
             }
-
-            // 2. Fusión RRF (BM25 + Semántica)
-            let bm25_hits = state.index_engine.search(query, limit * 2).unwrap_or_default();
-            let q_vec = state.embedder.embed(query);
-            let semantic_hits = state
-                .vector_store
-                .read()
-                .map(|vs| vs.search(&q_vec, limit * 2))
-                .unwrap_or_default();
-
-            let fused = HybridRanker::fuse(&bm25_hits, &semantic_hits, 1.0, 1.0, limit);
-            for hit in fused {
-                if seen_paths.insert(hit.path.clone()) {
-                    let badge = determine_badge(&hit.path);
-                    let snippet = if !hit.snippet.is_empty() {
-                        hit.snippet
-                    } else {
-                        format!("Puntuación combinada RRF: {:.4} (BM25: {:.2})", hit.rrf_score, hit.bm25_score)
-                    };
-
-                    output_items.push(json!({
-                        "name": hit.filename,
-                        "path": hit.path,
-                        "badge": badge,
-                        "size": "Hybrid",
-                        "score": format!("{:.4}", hit.rrf_score),
-                        "snippet": snippet
-                    }));
-                }
-            }
+        }
+        "documents" => {
+            // Documentos conocidos por nombre OR contenido + semántica de alta confianza
+            let ranked = execute_unified_ranked(state, trimmed, Some(FileCategory::Document), limit);
+            return json!(ranked);
+        }
+        _ => {
+            // Modo "all" (Híbrido):
+            // - Documentos por nombre o contenido + semántica filtrada
+            // - Multimedia e Imágenes/Diseño por nombre
+            // - Sistema/Binarios por nombre únicamente (menor prioridad que archivos de usuario)
+            let ranked = execute_unified_ranked(state, trimmed, None, limit);
+            return json!(ranked);
         }
     }
 
     output_items.truncate(limit);
     json!(output_items)
+}
+
+/// Motor de ranking unificado de alta precisión combinando coincidencia exacta de nombre, BM25 de contenido y vectores confiables.
+fn execute_unified_ranked(
+    state: &SharedRadarState,
+    query: &str,
+    category_filter: Option<FileCategory>,
+    limit: usize,
+) -> Vec<serde_json::Value> {
+    struct MergedCandidate {
+        name: String,
+        path: String,
+        size_label: String,
+        score: f32,
+        snippet: String,
+    }
+
+    let mut by_path: HashMap<String, MergedCandidate> = HashMap::new();
+    let norm_key = |p: &str| {
+        if cfg!(windows) { p.to_lowercase() } else { p.to_string() }
+    };
+
+    // 1. Coincidencias por nombre en Redb (ordenadas por precisión)
+    if let Ok(name_hits) = state.storage.search_by_name_ranked(query, category_filter, limit * 2) {
+        for (rec, name_score) in name_hits {
+            let path_str = rec.path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let key = norm_key(&path_str);
+            let cat = classify_path(&path_str);
+            by_path.insert(
+                key,
+                MergedCandidate {
+                    name: rec.name,
+                    path: path_str,
+                    size_label: format_file_size(rec.size),
+                    score: name_score,
+                    snippet: format!("Coincidencia por nombre ({:?}) · {}", cat, format_file_size(rec.size)),
+                },
+            );
+        }
+    }
+
+    // 2. Búsqueda de contenido BM25 (solo aplica si no se filtró a Multimedia/Diseño)
+    let allow_content = matches!(category_filter, None | Some(FileCategory::Document));
+    if allow_content {
+        if let Ok(bm25_hits) = state.index_engine.search(query, limit * 2) {
+            for hit in bm25_hits {
+                let key = norm_key(&hit.path);
+                let bm25_boost = (hit.score * 25.0).min(450.0);
+                by_path
+                    .entry(key)
+                    .and_modify(|c| {
+                        c.score += bm25_boost;
+                        c.snippet = format!("Nombre + Contenido BM25 (Relevancia {:.2})", hit.score);
+                    })
+                    .or_insert_with(|| MergedCandidate {
+                        name: hit.filename,
+                        path: hit.path,
+                        size_label: "Documento".to_string(),
+                        score: 120.0 + bm25_boost,
+                        snippet: format!("Contenido de documento BM25 (Relevancia {:.2})", hit.score),
+                    });
+            }
+        }
+
+        // 3. Búsqueda semántica solo con umbral estricto (>= 0.28) para evitar ruido irrelevante
+        let q_vec = state.embedder.embed(query);
+        if let Ok(vs) = state.vector_store.read() {
+            let sem_hits = vs.search(&q_vec, limit * 2);
+            for hit in sem_hits {
+                if hit.score < 0.28 || classify_path(&hit.path) != FileCategory::Document {
+                    continue;
+                }
+                if is_noisy_build_or_cache_path(&hit.path) {
+                    continue;
+                }
+                let key = norm_key(&hit.path);
+                let sem_boost = hit.score * 160.0;
+                let filename = Path::new(&hit.path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| hit.path.clone());
+
+                by_path
+                    .entry(key)
+                    .and_modify(|c| {
+                        c.score += sem_boost;
+                        if !hit.snippet.is_empty() {
+                            c.snippet = hit.snippet.clone();
+                        }
+                    })
+                    .or_insert_with(|| MergedCandidate {
+                        name: filename,
+                        path: hit.path,
+                        size_label: "Semántico".to_string(),
+                        score: sem_boost,
+                        snippet: hit.snippet,
+                    });
+            }
+        }
+    }
+
+    let mut candidates: Vec<MergedCandidate> = by_path.into_values().collect();
+    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    candidates.truncate(limit);
+
+    candidates
+        .into_iter()
+        .map(|c| {
+            let badge = determine_badge(&c.path);
+            json!({
+                "name": c.name,
+                "path": c.path,
+                "badge": badge,
+                "size": c.size_label,
+                "score": format!("{:.1}", c.score),
+                "snippet": c.snippet
+            })
+        })
+        .collect()
 }
 
 fn format_file_size(bytes: u64) -> String {
@@ -343,25 +473,35 @@ fn format_file_size(bytes: u64) -> String {
 }
 
 fn determine_badge(path: &str) -> &'static str {
-    let lower = path.to_lowercase();
-    if lower.ends_with(".rs") {
-        "RUST"
-    } else if lower.ends_with(".toml") {
-        "TOML"
-    } else if lower.ends_with(".pdf") {
-        "PDF"
-    } else if lower.ends_with(".docx") || lower.ends_with(".doc") {
-        "WORD"
-    } else if lower.ends_with(".xlsx") {
-        "EXCEL"
-    } else if lower.ends_with(".js") || lower.ends_with(".ts") {
-        "JS"
-    } else if lower.ends_with(".md") {
-        "DOC"
-    } else if lower.ends_with(".exe") {
-        "BIN"
-    } else {
-        "FILE"
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match ext.as_str() {
+        "pdf" => "PDF",
+        "doc" | "docx" | "docm" | "dotx" | "odt" | "rtf" => "WORD",
+        "xls" | "xlsx" | "xlsm" | "xlsb" | "ods" | "csv" | "tsv" => "EXCEL",
+        "ppt" | "pptx" | "pptm" | "ppsx" | "odp" => "PPTX",
+        "epub" | "mobi" | "azw3" | "djvu" => "EBOOK",
+        "md" | "txt" | "log" | "rst" => "DOC",
+        "rs" => "RUST",
+        "js" | "ts" | "jsx" | "tsx" => "JS",
+        "py" | "go" | "c" | "cpp" | "java" | "cs" | "php" | "html" | "css" | "json" | "toml" | "yaml" | "yml" | "sql" => "CODE",
+        "svg" | "ai" | "eps" | "cdr" | "cmx" => "VECTOR",
+        "psd" | "psb" | "xcf" | "afdesign" | "afphoto" | "fig" | "sketch" | "xd" | "indd" | "kra" => "DESIGN",
+        "dwg" | "dxf" | "dwf" | "step" | "stp" | "stl" | "obj" | "fbx" | "glb" | "blend" | "skp" | "rvt" => "CAD/3D",
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "tif" | "raw" | "cr2" | "nef" | "arw" | "dng" | "heic" => "IMG",
+        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" | "flv" | "m4v" => "VIDEO",
+        "mp3" | "wav" | "flac" | "aac" | "ogg" | "opus" | "wma" | "m4a" | "aiff" => "AUDIO",
+        "exe" | "dll" | "sys" | "msi" | "iso" | "bin" | "dat" => "SYS/BIN",
+        _ => match dragon_core::classify_extension(&ext) {
+            FileCategory::Document => "DOC",
+            FileCategory::Media => "MEDIA",
+            FileCategory::ImageOrDesign => "DESIGN",
+            FileCategory::SystemOrBinary => "BIN",
+        },
     }
 }
 
