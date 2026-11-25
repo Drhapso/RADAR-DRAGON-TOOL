@@ -1,0 +1,23 @@
+[package]
+name = "dragon-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dragon-service"
+path = "src/main.rs"
+
+[dependencies]
+dragon-core.workspace = true
+dragon-mft.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "dragon-ai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dragon-core.workspace = true
+dragon-index.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+anyhow.workspace = true
+log.workspace = true
+thiserror.workspace = true

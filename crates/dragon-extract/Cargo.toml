@@ -1,0 +1,15 @@
+[package]
+name = "dragon-extract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dragon-core.workspace = true
+lopdf.workspace = true
+quick-xml.workspace = true
+zip.workspace = true
+encoding_rs.workspace = true
+log.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true

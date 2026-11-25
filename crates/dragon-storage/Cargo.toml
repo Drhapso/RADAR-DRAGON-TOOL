@@ -1,0 +1,14 @@
+[package]
+name = "dragon-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dragon-core.workspace = true
+redb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+anyhow.workspace = true

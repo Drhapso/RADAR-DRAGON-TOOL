@@ -1,0 +1,58 @@
+[workspace]
+members = [
+    "crates/dragon-core",
+    "crates/dragon-mft",
+    "crates/dragon-index",
+    "crates/dragon-storage",
+    "crates/dragon-service",
+    "crates/dragon-extract",
+    "crates/dragon-ai",
+    "crates/dragon-mcp",
+    "crates/dragon-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Drhapso <radar-del-dragon@local>"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+dragon-core = { path = "crates/dragon-core" }
+dragon-mft = { path = "crates/dragon-mft" }
+dragon-index = { path = "crates/dragon-index" }
+dragon-storage = { path = "crates/dragon-storage" }
+dragon-extract = { path = "crates/dragon-extract" }
+dragon-ai = { path = "crates/dragon-ai" }
+dragon-mcp = { path = "crates/dragon-mcp" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["full"] }
+rayon = "1.10"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1.0"
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+tantivy = "0.22"
+jwalk = "0.8"
+redb = "2.4"
+lopdf = "0.34"
+quick-xml = "0.36"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+encoding_rs = "0.8"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_System_Pipes",
+] }
+
+[profile.release]
+opt-level = 3
+panic = "abort"

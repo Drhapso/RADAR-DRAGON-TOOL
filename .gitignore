@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+*.exe
+
+# Local Dragon Radar runtime indexes and databases
+/.dragon-data/
+/.dragon-index/
+/.dragon-models/
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log

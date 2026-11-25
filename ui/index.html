@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dragon Radar Tool - Tactical Search HUD</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@500;700;900&display=swap" rel="stylesheet">
+</head>
+<body class="crt-screen">
+    <div class="scanlines"></div>
+    <div class="vignette"></div>
+
+    <div class="radar-container">
+        <!-- Barra de Estado Superior -->
+        <header class="hud-header">
+            <div class="header-left">
+                <span class="radar-logo">⚡ DRAGON RADAR <span class="version-tag">v0.1.0-MFT</span></span>
+                <span class="status-indicator" id="statusIndicator"><span class="blink-dot"></span> MFT ENGINE: ARMED</span>
+            </div>
+            <div class="header-right">
+                <span class="hud-clock" id="hudClock">00:00:00</span>
+                <span class="db-stats" id="dbStats">INDEX: 106,066 ENTRIES</span>
+            </div>
+        </header>
+
+        <!-- Contenedor Principal: Radar a la izquierda, Feed a la derecha -->
+        <main class="hud-body">
+            <!-- Sección del Radar Circular -->
+            <section class="radar-visualizer-panel">
+                <div class="radar-frame">
+                    <canvas id="radarCanvas" width="360" height="360"></canvas>
+                    <div class="radar-hud-overlay">
+                        <div class="crosshair-h"></div>
+                        <div class="crosshair-v"></div>
+                        <span class="range-ring r1">25%</span>
+                        <span class="range-ring r2">50%</span>
+                        <span class="range-ring r3">75%</span>
+                        <span class="range-ring r4">MAX</span>
+                    </div>
+                </div>
+                <div class="radar-controls">
+                    <div class="sweep-speed-display">SWEEP: <span id="sweepStatus">ACTIVE (120 RPM)</span></div>
+                    <div class="detected-count">BLIPS DETECTED: <span id="blipCount" class="highlight-amber">0</span></div>
+                </div>
+            </section>
+
+            <!-- Sección de Búsqueda y Resultados -->
+            <section class="search-feed-panel">
+                <!-- Caja de Entrada Táctica -->
+                <div class="search-box-wrapper">
+                    <span class="prompt-symbol">&gt;&gt;</span>
+                    <input type="text" id="searchInput" class="tactical-input" placeholder="BUSCAR ARCHIVOS O CONTENIDO..." autofocus autocomplete="off" spellcheck="false">
+                    <div class="search-mode-toggles">
+                        <button class="mode-btn active" data-mode="all">HÍBRIDO</button>
+                        <button class="mode-btn" data-mode="filename">NOMBRE</button>
+                        <button class="mode-btn" data-mode="content">CONTENIDO</button>
+                        <button class="mode-btn" data-mode="mft">MFT RAW</button>
+                    </div>
+                </div>
+
+                <!-- Lista de Resultados -->
+                <div class="results-container" id="resultsContainer">
+                    <div class="empty-state">
+                        <p class="empty-title">RADAR EN ESPERA DE FRECUENCIA</p>
+                        <p class="empty-subtitle">Escribe un término para rastrear en disco (ej. <code>DeviceIoControl</code>, <code>ntfs</code>, <code>Cargo.toml</code>)</p>
+                    </div>
+                </div>
+
+                <!-- Barra de Atajos Inferior -->
+                <footer class="hud-footer">
+                    <div class="shortcut-tip"><kbd>↑</kbd><kbd>↓</kbd> NAVEGAR</div>
+                    <div class="shortcut-tip"><kbd>ENTER</kbd> ABRIR ARCHIVO</div>
+                    <div class="shortcut-tip"><kbd>SPACE</kbd> VISTA RÁPIDA</div>
+                    <div class="shortcut-tip"><kbd>ALT+SPACE</kbd> OCULTAR RADAR</div>
+                </footer>
+            </section>
+        </main>
+    </div>
+
+    <!-- Modal de Vista Rápida (Quick Look) -->
+    <div class="quick-look-modal" id="quickLookModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <span class="modal-title" id="modalTitle">VISTA RÁPIDA DE ARTIFACTO</span>
+                <button class="modal-close-btn" id="modalCloseBtn">&times;</button>
+            </div>
+            <div class="modal-body">
+                <pre class="code-preview" id="modalCodePreview">// Cargando contenido...</pre>
+            </div>
+        </div>
+    </div>
+
+    <script src="radar.js"></script>
+</body>
+</html>
