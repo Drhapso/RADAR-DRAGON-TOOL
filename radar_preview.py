@@ -387,7 +387,19 @@ def _preview_pdf(file_path: Path) -> tuple[int | None, str]:
                         break
             return page_count, "\n\n".join(parts)[:30_000]
     except Exception:
-        return None, ""
+        try:
+            from pypdf import PdfReader  # type: ignore
+            reader = PdfReader(str(file_path))
+            parts = []
+            for idx, page in enumerate(reader.pages[:50], start=1):
+                text = page.extract_text() or ""
+                if text:
+                    parts.append(f"--- Página {idx} ---\n{text.strip()}")
+                if sum(map(len, parts)) >= 30_000:
+                    break
+            return len(reader.pages), "\n\n".join(parts)[:30_000]
+        except Exception:
+            return None, ""
 
 
 def _parse_csv_rows(raw_text: str, delimiter: str) -> tuple[list[list[str]], int]:

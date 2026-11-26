@@ -1,0 +1,150 @@
+RADAR DEL DRAGON - CONTINUACION Y VALIDACION EN LA LAN
+====================================================
+
+PROPOSITO
+---------
+Completar una validacion controlada de la aplicacion cliente Python y del
+servicio de entrada LAN cuando Antigravity tenga acceso a la red corporativa.
+La indexacion, DB, consultas, rutas, previews y resultados deben permanecer en
+cada equipo cliente. Principal y respaldo deben servir la entrada y recursos
+aprobados sin convertirse en receptores/proxies de datos de busqueda.
+
+ARCHIVOS Y PAQUETE ACTUALES
+--------------------------
+- Paquete completo: dist\Radar-del-Dragon-Cliente-Offline-Python314-win-x64.zip
+- SHA256 externo: mismo nombre del ZIP seguido de .sha256.txt
+- El paquete incluye Python 3.14.10 x64 firmado por Python Software Foundation,
+  app Python, UI, activador, dependencias offline y MANIFEST-SHA256.txt.
+- Constructor reproducible: deploy\build-full-offline-client.ps1
+- El ZIP anterior client-wheelhouse-py314-win_amd64.zip es solo un wheelhouse y
+  no se debe usar como instalador completo.
+- La guia de pasos para Codex esta en INSTRUCCIONES_VALIDACION_CODEX.txt.
+- No se ejecuta ni distribuye dragon.exe como parte de este procedimiento.
+
+INVARIANTES
+-----------
+1. No modificar/desactivar/burlar CrowdStrike, Defender, AppLocker, WDAC,
+   PowerShell ExecutionPolicy, Firewall ni controles corporativos.
+2. No elevar permisos en clientes. Si aparece UAC o una solicitud de credenciales,
+   cancelar el paso y registrar exactamente que operacion las requiere.
+3. No instalar servicios SYSTEM, drivers, tareas privilegiadas ni reglas Firewall
+   en clientes. El cliente esta diseñado para instalarse por usuario y escuchar
+   solo en 127.0.0.1:8092.
+4. No cambiar a shared_server. No compartir los indices o DB locales.
+5. No enviar a servidores centrales consultas, rutas, nombres, contenido, previews,
+   errores que expongan rutas o resultados. No habilitar logs de proxy con URL/query
+   para endpoints de datos.
+6. Antes de editar, inspeccionar git status y diffs. Preservar cualquier cambio
+   existente; no borrar datos, DB, indices ni configuracion real.
+7. No afirmar disponibilidad, failover, privacidad validada ni compatibilidad EDR
+   antes de recopilar evidencia en la red y en los equipos piloto.
+
+CONFIGURACION DE RED: VERIFICAR, NO SUPONER
+-------------------------------------------
+El codigo/configuracion de ejemplo contiene referencias historicas:
+- principal: 172.23.174.103
+- respaldo/proxy: 172.23.174.11
+- subred: 172.23.174.0/24
+- puerto usual: TCP 8092
+
+Estos valores NO son prueba del estado actual. Confirmar con TI nombre DNS/VIP,
+IP, segmento, TLS, origen visible por navegador, puerto, health checks, Caddy o
+proxy vigente, reglas de Firewall, certificados, tareas/servicios, rutas reales y
+procedimiento de rollback. No publicar ni copiar archivos operativos desde D:\script
+u otra ruta hasta confirmar su dueño, version y estado. No modificar servidores
+sin el proceso de cambio aprobado.
+
+FLUJO DE TRABAJO
+----------------
+1. Desde la raiz del repositorio, documentar fecha, commit/estado, archivos ya
+   modificados y versiones. Leer README.md, DOCUMENTACION.md y las instrucciones
+   de validacion Codex. No limpiar el arbol de trabajo.
+2. Inspeccionar el ZIP y comparar SHA256 con su sidecar obtenido por canal confiable.
+   Revisar MANIFEST-SHA256.txt, las 14 ruedas, los scripts y que no haya DB, logs,
+   caches, configuracion privada o datos de usuarios dentro del paquete.
+3. Confirmar firma Authenticode y firmante del instalador Python incluido. La
+   validez de firma/hash no sustituye la aprobacion de TI o CrowdStrike.
+4. En un PC piloto autorizado, con usuario estandar, instalar desde el paquete
+   completo. Primero documentar versiones Python existentes y politicas. No forzar
+   ExecutionPolicy. Ejecutar INSTALL_OFFLINE.bat segun las reglas corporativas.
+   Si un control bloquea runtime/script, preservar el evento y pedir a TI la via
+   aprobada; no cambiar nombre, empaquetar, ofuscar ni lanzar por otro host.
+5. Comprobar en el cliente: interfaz local, /health, agente en 127.0.0.1:8092,
+   tarea solo del usuario y nivel Limited si quedo registrada. Si la tarea esta
+   prohibida, probar solo el modo de sesion actual, explicando que no persiste al
+   cerrar sesion. Verificar DB y reportes bajo LocalAppData del usuario.
+6. Confirmar las rutas/unidades que el indexador realmente incluye/excluye y los
+   permisos efectivos del usuario. Comparar un conjunto pequeno conocido con
+   resultados. No asumir indexacion de todas las carpetas o archivos protegidos.
+7. Revisar la UI en principal y respaldo. Desde Developer Tools, observar destino
+   de las solicitudes de busqueda, estado, preview y apertura: deben ir al agente
+   loopback del cliente. Solo documentos estaticos, health y recursos de activacion
+   expresamente aprobados pueden solicitarse al host LAN.
+8. En una ventana autorizada de observacion, comprobar logs/captura del proxy y
+   principal. No deben aparecer terminos de consulta, rutas, previews, ni llamadas
+   reenviadas a APIs de datos. No habilitar logging adicional que recoja datos.
+9. Desde PC-B intentar acceder a APIs de datos de PC-A/servidor en modo local_agent.
+   Debe fallar por diseño. La respuesta no debe revelar estado de indexacion ni
+   permitir iniciar un escaneo remoto.
+10. Probar indisponibilidad de principal solo en ventana aprobada. Verificar que la
+    URL estable sirve la interfaz desde el respaldo y que el navegador sigue usando
+    el agente local; restaurar el principal y comprobar recuperacion sin perdida.
+11. Tras validar cliente, probar reinicio de PC, reinicio de agentes y recuperacion
+    SQLite. Medir primer escaneo y actualizaciones incrementales en uno o mas equipos
+    de referencia. Registrar archivos detectados, tiempo, memoria, errores y volumen.
+12. Antes de cualquier despliegue amplio, presentar evidencia y pedir aprobacion de
+    TI/seguridad para todos los componentes y el plan de reversa.
+
+PRUEBAS DE ACEPTACION Y EVIDENCIA
+---------------------------------
+A. Privacidad por equipo: PC-A y PC-B crean indices distintos y encuentran los
+   archivos locales esperados; no encuentran los archivos exclusivos del otro PC.
+   Evidencia: resultado de busqueda controlado y rutas de DB por equipo.
+B. Red: solicitudes de datos van a 127.0.0.1 del mismo cliente; servidores/proxy no
+   reciben ni retransmiten consultas, rutas, contenido, previews o resultados.
+C. Control de acceso: APIs locales no son accesibles desde otro cliente y no
+   empiezan trabajos de indexacion remotos. Probar CORS desde origen autorizado y
+   uno no autorizado, sin comodines.
+D. Resiliencia: interfaz disponible por direccion estable si principal no responde;
+   agente local y sus datos siguen locales durante el failover.
+E. Persistencia: cerrar/reiniciar sesion y reiniciar cliente segun el modo instalado;
+   verificar tarea por usuario, salud, DB SQLite y actualizacion del indice.
+F. Permisos: probar carpeta legible y carpeta denegada. Documentar incompletitud sin
+   borrar entradas previas válidas ni presentar el indice como completo.
+G. Unidades: desconectar y reconectar unidad removible/unidad de red si esta en el
+   alcance. Validar ausencia, recuperacion y ausencia de duplicados.
+H. Rendimiento: medir escaneo inicial y actualizacion en volumen de referencia,
+   tiempo, conteos y memoria. TI debe definir umbrales antes del rollout.
+I. EDR/politicas: registrar estado de seguridad sin solicitar exclusiones. Cualquier
+   bloqueo detiene la ampliacion hasta autorizacion formal.
+J. Paquete: registrar SHA256 externo, resultado de cada entrada del manifiesto,
+   firma del runtime, version Python, versiones instaladas y resultado pip check.
+K. Recuperacion: comprobar backup/rollback aprobado de UI/config de servidor y
+   procedimiento de desinstalacion por usuario sin borrar datos requeridos.
+
+Registrar para cada prueba: equipo, usuario/rol, hora, version/commit, comando o
+procedimiento, resultado esperado, resultado observado, evidencia con datos sensibles
+ocultos, estado (PASS/FAIL/BLOCKED) y responsable. No incluir consultas/rutas reales
+de usuario en el informe; utilizar carpetas y nombres sinteticos creados para la
+prueba.
+
+CRITERIOS DE PARADA
+-------------------
+- IP, origen, TLS, proxy, DNS o puertos no confirmados por TI.
+- Script/runtime/wheel bloqueado, firma no valida o manifiesto/hash discrepante.
+- Solicitud de elevacion en cliente, acceso no autorizado o cambio de politica.
+- Cualquier consulta/ruta/preview visible en logs o trafico central.
+- Failover que redirige API de datos al servidor, CORS comodin o shared_server.
+- Perdida/corrupcion de DB, resultados de otro equipo o mediciones no reproducibles.
+
+No reparar estos casos mediante bypass. Capturar el error minimo necesario y
+entregarlo a TI/seguridad. Marcar la prueba como BLOCKED o FAIL y detener rollout.
+
+INFORME FINAL DE ANTIGRAVITY
+---------------------------
+Entregar resumen con: estado inicial y cambios, version/sha256 del paquete, equipos
+piloto, configuracion de red confirmada por TI, resultado A-K, ubicacion local de
+datos, evidencia de trafico/logs sin datos, estado CrowdStrike/politicas, fallos,
+limitaciones, aprobaciones pendientes, plan y resultado de rollback. Diferenciar
+claramente lo que se inspecciono en archivos de lo que se verifico efectivamente
+en la LAN. No declarar "garantizado"; informar el alcance y la evidencia observada.

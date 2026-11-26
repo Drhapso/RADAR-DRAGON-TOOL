@@ -231,8 +231,8 @@ function renderDriveChips(drives) {
     }
     indexDrivesList.innerHTML = drives.map(d => {
         const st = String(d.status || 'PENDING').toUpperCase();
-        const cls = st === 'OK' ? 'ok' : st === 'INDEXING' ? 'indexing' : st === 'MISSING' ? 'missing' : 'pending';
-        const icon = st === 'OK' ? '✓' : st === 'INDEXING' ? '⟳' : st === 'MISSING' ? '!' : '…';
+        const cls = st === 'OK' ? 'ok' : st === 'PARTIAL' ? 'partial' : st === 'INDEXING' ? 'indexing' : st === 'MISSING' ? 'missing' : 'pending';
+        const icon = st === 'OK' ? '\u2713' : st === 'PARTIAL' || st === 'MISSING' ? '!' : st === 'INDEXING' ? '\u27F3' : '\u2026';
         const files = Number(d.indexed_files || 0).toLocaleString();
         const targetsInfo = Number(d.targets_total || 0) > 0
             ? ` (${d.targets_completed || 0}/${d.targets_total})`
@@ -273,13 +273,15 @@ function applyHudStatusData(data) {
         if (data.phase === 'RECOVERING_DB') {
             statusInd.innerHTML = `<span class="blink-dot"></span> RECUPERANDO BASE DE DATOS...`;
         } else if (data.phase === 'ERROR') {
-            statusInd.innerHTML = `<span class="blink-dot"></span> ERROR DE BASE DE DATOS`;
+            statusInd.innerHTML = `<span class="blink-dot"></span> ERROR DE INDEXACI\u00D3N`;
         } else if (data.phase === 'INITIAL_INDEXING') {
             statusInd.innerHTML = `<span class="blink-dot"></span> INDEXANDO [${data.target_index}/${data.total_targets} · ${pct.toFixed(0)}%]`;
         } else if (data.phase === 'RESUMING_CHECKPOINT') {
             statusInd.innerHTML = `<span class="blink-dot"></span> REANUDANDO [${data.target_index}/${data.total_targets} · ${pct.toFixed(0)}%]`;
         } else if (data.phase === 'VALIDATING_INDEX') {
             statusInd.innerHTML = `<span class="blink-dot"></span> VALIDANDO EQUIPO [${data.target_index}/${data.total_targets}]`;
+        } else if (data.index_partial) {
+            statusInd.innerHTML = `<span class="blink-dot"></span> \u00CDNDICE PARCIAL \u00B7 REVISA UNIDADES`;
         } else {
             statusInd.innerHTML = `<span class="blink-dot"></span> ${editionTag}`;
         }
@@ -296,7 +298,7 @@ function applyHudStatusData(data) {
 
     if (indexLiveBar) {
         const drives = Array.isArray(data.drives) ? data.drives : [];
-        const hasMissingDrive = drives.some(d => d.status === 'MISSING');
+        const hasMissingDrive = drives.some(d => d.status === 'MISSING' || d.status === 'PARTIAL');
         const showBar = isIndexing || hasMissingDrive;
         indexLiveBar.hidden = !showBar;
         if (showBar) {
@@ -306,7 +308,10 @@ function applyHudStatusData(data) {
                 if (data.phase === 'RECOVERING_DB') {
                     indexLiveText.textContent = `${data.current_file || 'Abriendo/recuperando radar.redb...'} · La búsqueda se activará automáticamente al terminar`;
                 } else if (data.phase === 'ERROR') {
-                    indexLiveText.textContent = `ERROR: ${data.current_target || data.last_checkpoint || 'No se pudo abrir la base de datos'}`;
+                    indexLiveText.textContent = `ERROR: ${data.last_error || data.current_target || data.last_checkpoint || 'No se pudo completar la indexaci\u00F3n'}`;
+                } else if (data.index_partial) {
+                    const failures = Number(data.access_errors || 0);
+                    indexLiveText.textContent = `Escaneo parcial: ${failures} incidencia(s) de acceso. Revisa permisos o unidades; se conservaron datos previos.`;
                 } else {
                     const targetStr = data.current_target ? ` · ${data.current_target}` : '';
                     const subProgress = Number(data.target_total || 0) > 0
@@ -368,19 +373,17 @@ function startIndexStream() {
     } catch (_) {}
 }
 
-// Regla al abrir la plataforma: validar si la indexación está completa o falta alguna parte.
-// Si está completa cierra ventanas de comandos auxiliares; si falta alguna parte continúa en segundo plano.
+// La validación solo consulta el agente local. Nunca se pide al servidor LAN que indexe el equipo anfitrión.
 async function validateIndexOnOpen() {
     if (window.location.protocol === 'file:') return;
     try {
-        if (!isLocalOrigin && apiBase !== '') {
-            fetch('/api/index/validate').catch(() => {});
-        }
         const res = await fetch(`${apiBase}/api/index/validate`);
         if (res.ok) {
             const v = await res.json();
             const statusInd = document.getElementById('statusIndicator');
-            if (statusInd && v && v.complete === false) {
+            if (statusInd && v && v.partial) {
+                statusInd.innerHTML = `<span class="blink-dot"></span> \u00CDNDICE PARCIAL \u00B7 REVISA UNIDADES`;
+            } else if (statusInd && v && v.complete === false) {
                 const pending = Number(v.pending_targets || 0);
                 statusInd.innerHTML = `<span class="blink-dot"></span> INDEXANDO EN SEGUNDO PLANO${pending > 0 ? ` (${pending} PEND.)` : ''}`;
             }
@@ -565,7 +568,7 @@ async function performSearch(query, options = {}) {
         resultsContainer.innerHTML = `
             <div class="empty-state">
                 <p class="empty-title">ACTIVA EL RADAR EN ESTE EQUIPO</p>
-                <p class="empty-subtitle">Haz clic en "ACTIVAR EN ESTE EQUIPO" arriba para escanear y buscar los archivos locales de esta computadora.</p>
+                <p class="empty-subtitle">Descarga y abre el activador local para instalar el agente Python en tu perfil e indexar este equipo. No solicita permisos de administrador; requiere Python aprobado y dependencias disponibles.</p>
             </div>
         `;
         return;

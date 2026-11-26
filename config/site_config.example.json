@@ -2,6 +2,13 @@
   "port": 8092,
   "lan_mode": "local_agent",
   "authorized_subnet": "",
+  "primary_host": "172.23.174.103",
+  "proxy_host": "172.23.174.11",
+  "allowed_server_hosts": ["172.23.174.103", "172.23.174.11"],
+  "public_scheme": "http",
+  "public_port": 8092,
+  "local_agent_port": 8092,
+  "allowed_ui_origins": [],
   "shared_paths": [],
   "libreoffice_path": "",
   "sync_interval_minutes": 15

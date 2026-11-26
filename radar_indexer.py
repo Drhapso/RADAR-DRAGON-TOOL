@@ -243,7 +243,19 @@ def _extract_pdf_text(file_path: Path) -> str:
     try:
         import pymupdf  # type: ignore
     except ImportError:
-        return ""
+        try:
+            from pypdf import PdfReader  # type: ignore
+            reader = PdfReader(str(file_path))
+            chunks = []
+            for page in reader.pages[:MAX_PDF_PAGES_INDEX]:
+                text = page.extract_text() or ""
+                if text:
+                    chunks.append(text)
+                if sum(map(len, chunks)) >= MAX_CONTENT_CHARS:
+                    break
+            return _clean_extracted_text(" ".join(chunks))
+        except Exception:
+            return ""
     chunks: list[str] = []
     total_len = 0
     with pymupdf.open(str(file_path)) as doc:
@@ -354,8 +366,14 @@ def _extract_opendoc_text(file_path: Path) -> str:
         return ""
 
 
-def discover_local_targets() -> tuple[list[str], list[Path]]:
-    """Descubre unidades fijas locales y carpetas de datos de usuario (sin SO)."""
+def _iter_scandir_entries(directory: Path):
+    """Yield entries without materializing a potentially huge directory."""
+    with os.scandir(directory) as iterator:
+        yield from iterator
+
+
+def discover_local_targets(failed_drives: set[str] | None = None) -> tuple[list[str], list[Path]]:
+    """Discover local data folders and report volumes whose discovery was incomplete."""
     drives: list[str] = []
     if hasattr(os, "listdrives"):
         raw_drives = os.listdrives()
@@ -370,6 +388,8 @@ def discover_local_targets() -> tuple[list[str], list[Path]]:
             if usage.total > 0 and os.path.isdir(norm):
                 drives.append(norm.upper())
         except OSError:
+            if failed_drives is not None:
+                failed_drives.add(extract_drive_label(norm))
             continue
 
     targets: list[Path] = []
@@ -409,9 +429,11 @@ def discover_local_targets() -> tuple[list[str], list[Path]]:
                                     continue
                                 add_target(Path(sub_entry.path))
                         except OSError:
-                            pass
+                            if failed_drives is not None:
+                                failed_drives.add(extract_drive_label(str(profile)))
                 except OSError:
-                    pass
+                    if failed_drives is not None:
+                        failed_drives.add(extract_drive_label(str(users_dir)))
             try:
                 for entry in os.scandir(drv_path):
                     if not entry.is_dir(follow_symlinks=False):
@@ -421,7 +443,8 @@ def discover_local_targets() -> tuple[list[str], list[Path]]:
                         continue
                     add_target(Path(entry.path))
             except OSError:
-                pass
+                if failed_drives is not None:
+                    failed_drives.add(extract_drive_label(str(drv_path)))
         else:
             try:
                 for entry in os.scandir(drv_path):
@@ -432,7 +455,8 @@ def discover_local_targets() -> tuple[list[str], list[Path]]:
                         continue
                     add_target(Path(entry.path))
             except OSError:
-                pass
+                if failed_drives is not None:
+                    failed_drives.add(extract_drive_label(str(drv_path)))
 
     return drives, targets
 
@@ -440,6 +464,7 @@ def discover_local_targets() -> tuple[list[str], list[Path]]:
 @dataclass
 class IndexTelemetry:
     phase: str = "READY"
+    last_error: str = ""
     percent: float = 100.0
     target_index: int = 0
     total_targets: int = 0
@@ -454,6 +479,8 @@ class IndexTelemetry:
     skipped_files: int = 0
     last_checkpoint: str = ""
     last_sync_ms: int = 0
+    last_duration_ms: int = 0
+    access_errors: int = 0
     initial_scan_completed: bool = False
     drives: list[dict[str, Any]] = field(default_factory=list)
 
@@ -541,15 +568,24 @@ class RadarIndexer:
     def _load_persisted_state(self) -> None:
         initial_done = self.get_setting("initial_scan_completed") == "1"
         last_cp = self.get_setting("last_checkpoint") or ""
-        last_sync_raw = self.get_setting("last_sync_ms") or "0"
         try:
-            last_sync_ms = int(last_sync_raw)
+            last_sync_ms = int(self.get_setting("last_sync_ms") or "0")
         except ValueError:
             last_sync_ms = 0
+        try:
+            last_duration_ms = int(self.get_setting("last_duration_ms") or "0")
+        except ValueError:
+            last_duration_ms = 0
+        try:
+            access_errors = int(self.get_setting("access_errors") or "0")
+        except ValueError:
+            access_errors = 0
         with self._telemetry_lock:
             self.telemetry.initial_scan_completed = initial_done
             self.telemetry.last_checkpoint = last_cp
             self.telemetry.last_sync_ms = last_sync_ms
+            self.telemetry.last_duration_ms = last_duration_ms
+            self.telemetry.access_errors = access_errors
             self.telemetry.phase = "READY" if initial_done else "INITIAL_INDEXING"
             self.telemetry.percent = 100.0 if initial_done else 0.0
 
@@ -598,6 +634,7 @@ class RadarIndexer:
             t = self.telemetry
             return {
                 "phase": t.phase,
+                "last_error": t.last_error,
                 "percent": round(t.percent, 2),
                 "target_index": t.target_index,
                 "total_targets": t.total_targets,
@@ -612,6 +649,8 @@ class RadarIndexer:
                 "skipped_files": t.skipped_files,
                 "last_checkpoint": t.last_checkpoint,
                 "last_sync_ms": t.last_sync_ms,
+                "last_duration_ms": t.last_duration_ms,
+                "access_errors": t.access_errors,
                 "initial_scan_completed": t.initial_scan_completed,
                 "drives": list(t.drives),
             }
@@ -634,7 +673,11 @@ class RadarIndexer:
         self._run_sync_worker(custom_targets)
         return self.get_telemetry_snapshot()
 
-    def _resolve_targets(self, custom_targets: list[Path] | None) -> tuple[list[str], list[Path]]:
+    def _resolve_targets(
+        self,
+        custom_targets: list[Path] | None,
+        discovery_failures: set[str] | None = None,
+    ) -> tuple[list[str], list[Path]]:
         if custom_targets is not None:
             valid = [Path(p) for p in custom_targets if Path(p).is_dir()]
             drives = sorted({extract_drive_label(str(p)) for p in valid})
@@ -643,24 +686,44 @@ class RadarIndexer:
             valid = [p for p in self.shared_roots if p.is_dir()]
             drives = sorted({extract_drive_label(str(p)) for p in valid})
             return drives, valid
-        return discover_local_targets()
+        return discover_local_targets(discovery_failures)
 
     def _run_sync_worker(self, custom_targets: list[Path] | None = None) -> None:
+        read_conn: sqlite3.Connection | None = None
+        cycle_started = time.monotonic()
+        access_errors = 0
+        discovery_failures: set[str] = set()
         try:
-            drives, targets = self._resolve_targets(custom_targets)
+            drives, targets = self._resolve_targets(custom_targets, discovery_failures)
+            access_errors = len(discovery_failures)
             scan_gen = int(time.time() * 1000)
             was_completed = self.get_setting("initial_scan_completed") == "1"
             phase_name = "VALIDATING_INDEX" if was_completed else "INITIAL_INDEXING"
 
             drive_stats: dict[str, dict[str, Any]] = {}
-            for d in drives:
+            for d in sorted(set(drives) | discovery_failures):
                 drive_stats[d] = {
                     "drive": d,
-                    "status": "PENDING",
+                    "status": "PARTIAL" if d in discovery_failures else "PENDING",
                     "indexed_files": 0,
                     "targets_completed": 0,
                     "targets_total": 0,
                 }
+            # Keep offline volumes visible in telemetry and preserve their DB rows.
+            known_conn = self._connect()
+            try:
+                known_drives = {str(row[0]) for row in known_conn.execute("SELECT DISTINCT drive FROM files") if row[0]}
+            finally:
+                known_conn.close()
+            for missing_drive in known_drives - set(drives):
+                drive_stats[missing_drive] = {
+                    "drive": missing_drive,
+                    "status": "MISSING",
+                    "indexed_files": 0,
+                    "targets_completed": 0,
+                    "targets_total": 0,
+                }
+
             for tgt in targets:
                 d = extract_drive_label(str(tgt))
                 if d not in drive_stats:
@@ -673,8 +736,13 @@ class RadarIndexer:
                     }
                 drive_stats[d]["targets_total"] += 1
 
+            # A complete cycle may still be incomplete for an individual volume:
+            # access-denied directories and disconnected roots must never trigger pruning.
+            scan_failed_drives: set[str] = set(discovery_failures)
+
             with self._telemetry_lock:
                 self.telemetry.phase = phase_name
+                self.telemetry.last_error = ""
                 self.telemetry.percent = 0.0
                 self.telemetry.target_index = 0
                 self.telemetry.total_targets = len(targets)
@@ -688,16 +756,8 @@ class RadarIndexer:
                 self.telemetry.skipped_files = 0
                 self.telemetry.drives = list(drive_stats.values())
 
-            existing_map: dict[str, tuple[int, int, int]] = {}
-            conn_read = self._connect()
-            try:
-                for row in conn_read.execute("SELECT id, path, size, mtime_ms FROM files"):
-                    existing_map[str(row["path"])] = (int(row["id"]), int(row["size"]), int(row["mtime_ms"]))
-            finally:
-                conn_read.close()
-
+            read_conn = self._connect()
             pending_ops: list[tuple[str, Any]] = []
-            seen_ids: set[int] = set()
 
             def flush_batch() -> None:
                 if not pending_ops:
@@ -795,125 +855,134 @@ class RadarIndexer:
                 while stack and not self._stop_event.is_set():
                     current_dir = stack.pop()
                     try:
-                        with os.scandir(current_dir) as it:
-                            entries = list(it)
-                    except OSError:
-                        continue
-
-                    for entry in entries:
-                        if self._stop_event.is_set():
-                            break
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                low_name = entry.name.lower()
-                                if (
-                                    low_name in SYSTEM_EXCLUDED_DIRS
-                                    or low_name in NOISY_EXCLUDED_DIRS
-                                    or low_name.startswith("$")
-                                ):
+                        for entry in _iter_scandir_entries(current_dir):
+                            if self._stop_event.is_set():
+                                break
+                            try:
+                                if entry.is_dir(follow_symlinks=False):
+                                    low_name = entry.name.lower()
+                                    if (
+                                        low_name in SYSTEM_EXCLUDED_DIRS
+                                        or low_name in NOISY_EXCLUDED_DIRS
+                                        or low_name.startswith("$")
+                                    ):
+                                        continue
+                                    stack.append(Path(entry.path))
                                     continue
-                                stack.append(Path(entry.path))
+                                if not entry.is_file(follow_symlinks=False):
+                                    continue
+                                st = entry.stat(follow_symlinks=False)
+                            except OSError:
+                                scan_failed_drives.add(drv)
+                                access_errors += 1
                                 continue
-                            if not entry.is_file(follow_symlinks=False):
-                                continue
-                            st = entry.stat(follow_symlinks=False)
-                        except OSError:
-                            continue
 
-                        path_s = os.path.normpath(entry.path)
-                        size = int(st.st_size)
-                        mtime_ms = int(st.st_mtime * 1000)
-                        processed_in_target += 1
+                            path_s = os.path.normpath(entry.path)
+                            size = int(st.st_size)
+                            mtime_ms = int(st.st_mtime * 1000)
+                            processed_in_target += 1
+                            if drv in drive_stats:
+                                drive_stats[drv]["indexed_files"] += 1
 
-                        if drv in drive_stats:
-                            drive_stats[drv]["indexed_files"] += 1
-
-                        prev = existing_map.get(path_s)
-                        if prev is not None and prev[1] == size and prev[2] == mtime_ms:
-                            seen_ids.add(prev[0])
-                            pending_ops.append(("touch", prev[0]))
-                            with self._telemetry_lock:
-                                self.telemetry.skipped_files += 1
-                                self.telemetry.target_processed = processed_in_target
-                                if processed_in_target % 50 == 0:
-                                    self.telemetry.current_file = entry.name
-                        else:
-                            name = entry.name
-                            ext = Path(name).suffix.lower().lstrip(".")
-                            cat, badge = classify_extension(ext)
-                            content_text = ""
-                            if ext in TEXT_EXTRACT_EXTS or ext in OFFICE_EXTRACT_EXTS:
-                                content_text = extract_searchable_text(Path(path_s), ext, size)
-                            has_content = 1 if content_text else 0
-                            snippet = content_text[:220] if content_text else ""
-                            name_fold = fold_text(name)
-                            path_fold = fold_text(path_s)
-
-                            if prev is None:
-                                pending_ops.append(
-                                    (
-                                        "insert",
-                                        (
-                                            path_s, name, name_fold, path_fold, ext, cat, badge, drv,
-                                            size, mtime_ms, has_content, snippet, content_text,
-                                        ),
-                                    )
-                                )
+                            row = read_conn.execute(
+                                "SELECT id, size, mtime_ms FROM files WHERE path = ?", (path_s,)
+                            ).fetchone()
+                            prev = (int(row["id"]), int(row["size"]), int(row["mtime_ms"])) if row else None
+                            if prev is not None and prev[1] == size and prev[2] == mtime_ms:
+                                pending_ops.append(("touch", prev[0]))
                                 with self._telemetry_lock:
-                                    self.telemetry.new_files += 1
+                                    self.telemetry.skipped_files += 1
                                     self.telemetry.target_processed = processed_in_target
-                                    self.telemetry.current_file = name
+                                    if processed_in_target % 50 == 0:
+                                        self.telemetry.current_file = entry.name
                             else:
-                                seen_ids.add(prev[0])
-                                pending_ops.append(
-                                    (
-                                        "update",
-                                        (
-                                            prev[0], path_s, name, name_fold, path_fold, ext, cat, badge, drv,
-                                            size, mtime_ms, has_content, snippet, content_text,
-                                        ),
-                                    )
-                                )
-                                with self._telemetry_lock:
-                                    self.telemetry.updated_files += 1
-                                    self.telemetry.target_processed = processed_in_target
-                                    self.telemetry.current_file = name
+                                name = entry.name
+                                ext = Path(name).suffix.lower().lstrip(".")
+                                cat, badge = classify_extension(ext)
+                                content_text = ""
+                                if ext in TEXT_EXTRACT_EXTS or ext in OFFICE_EXTRACT_EXTS:
+                                    content_text = extract_searchable_text(Path(path_s), ext, size)
+                                has_content = 1 if content_text else 0
+                                snippet = content_text[:220] if content_text else ""
+                                name_fold = fold_text(name)
+                                path_fold = fold_text(path_s)
+                                if prev is None:
+                                    pending_ops.append(("insert", (
+                                        path_s, name, name_fold, path_fold, ext, cat, badge, drv,
+                                        size, mtime_ms, has_content, snippet, content_text,
+                                    )))
+                                    with self._telemetry_lock:
+                                        self.telemetry.new_files += 1
+                                        self.telemetry.target_processed = processed_in_target
+                                        self.telemetry.current_file = name
+                                else:
+                                    pending_ops.append(("update", (
+                                        prev[0], path_s, name, name_fold, path_fold, ext, cat, badge, drv,
+                                        size, mtime_ms, has_content, snippet, content_text,
+                                    )))
+                                    with self._telemetry_lock:
+                                        self.telemetry.updated_files += 1
+                                        self.telemetry.target_processed = processed_in_target
+                                        self.telemetry.current_file = name
 
-                        if len(pending_ops) >= BATCH_COMMIT_SIZE:
-                            flush_batch()
+                            if len(pending_ops) >= BATCH_COMMIT_SIZE:
+                                flush_batch()
+                    except OSError:
+                        scan_failed_drives.add(drv)
+                        access_errors += 1
+                        continue
 
                 flush_batch()
                 if drv in drive_stats:
                     drive_stats[drv]["targets_completed"] += 1
                     if drive_stats[drv]["targets_completed"] >= drive_stats[drv]["targets_total"]:
-                        drive_stats[drv]["status"] = "OK"
+                        drive_stats[drv]["status"] = "PARTIAL" if drv in scan_failed_drives else "OK"
 
             # Prune deleted files only if scan completed uninterrupted
             deleted_count = 0
             if not self._stop_event.is_set():
-                with self._write_lock:
-                    conn = self._connect()
-                    try:
-                        stale_rows = conn.execute(
-                            "SELECT id FROM files WHERE scan_gen < ?", (scan_gen,)
-                        ).fetchall()
-                        if stale_rows:
-                            stale_ids = [(int(r["id"]),) for r in stale_rows]
-                            conn.executemany("DELETE FROM files_fts WHERE rowid = ?", stale_ids)
-                            conn.executemany("DELETE FROM files WHERE id = ?", stale_ids)
-                            deleted_count = len(stale_ids)
-                        conn.commit()
-                    finally:
-                        conn.close()
+                prune_drives = [
+                    drive
+                    for drive, info in drive_stats.items()
+                    if info["targets_total"] > 0
+                    and info["targets_completed"] >= info["targets_total"]
+                    and drive not in scan_failed_drives
+                ]
+                if prune_drives:
+                    placeholders = ",".join("?" for _ in prune_drives)
+                    with self._write_lock:
+                        conn = self._connect()
+                        try:
+                            stale_rows = conn.execute(
+                                f"SELECT id FROM files WHERE drive IN ({placeholders}) AND scan_gen < ?",
+                                (*prune_drives, scan_gen),
+                            ).fetchall()
+                            if stale_rows:
+                                stale_ids = [(int(r["id"]),) for r in stale_rows]
+                                conn.executemany("DELETE FROM files_fts WHERE rowid = ?", stale_ids)
+                                conn.executemany("DELETE FROM files WHERE id = ?", stale_ids)
+                                deleted_count = len(stale_ids)
+                            conn.commit()
+                        finally:
+                            conn.close()
 
                 now_ms = int(time.time() * 1000)
+                duration_ms = max(0, int((time.monotonic() - cycle_started) * 1000))
                 cp_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 self.set_setting("initial_scan_completed", "1")
                 self.set_setting("last_checkpoint", cp_label)
                 self.set_setting("last_sync_ms", str(now_ms))
+                self.set_setting("last_duration_ms", str(duration_ms))
+                self.set_setting("access_errors", str(access_errors))
 
-                for d_info in drive_stats.values():
-                    if d_info["status"] != "OK":
+                for drive, d_info in drive_stats.items():
+                    if d_info["status"] == "MISSING":
+                        continue
+                    if drive in scan_failed_drives or d_info["targets_total"] == 0:
+                        d_info["status"] = "PARTIAL"
+                    elif d_info["targets_completed"] < d_info["targets_total"]:
+                        d_info["status"] = "PENDING"
+                    else:
                         d_info["status"] = "OK"
 
                 with self._telemetry_lock:
@@ -924,14 +993,22 @@ class RadarIndexer:
                     self.telemetry.deleted_files = deleted_count
                     self.telemetry.last_checkpoint = cp_label
                     self.telemetry.last_sync_ms = now_ms
+                    self.telemetry.last_duration_ms = duration_ms
+                    self.telemetry.access_errors = access_errors
                     self.telemetry.initial_scan_completed = True
                     self.telemetry.drives = [dict(v) for v in drive_stats.values()]
         except Exception as exc:
             LOG.exception("Error en ciclo de indexación: %s", exc)
             with self._telemetry_lock:
-                self.telemetry.phase = "READY"
+                self.telemetry.phase = "ERROR"
+                self.telemetry.last_error = str(exc)[:500]
                 self.telemetry.current_file = ""
         finally:
+            if read_conn is not None:
+                try:
+                    read_conn.close()
+                except sqlite3.Error:
+                    pass
             self._sync_running.clear()
 
     def get_extensions(self, prefix: str = "", limit: int = 18) -> list[dict[str, Any]]:

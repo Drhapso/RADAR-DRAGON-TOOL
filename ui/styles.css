@@ -526,6 +526,12 @@ body.anime-world {
     color: #78350F;
 }
 
+.drive-chip.partial {
+    background: #FEF3C7;
+    color: #92400E;
+    border-color: #B45309;
+}
+
 .drive-chip.pending {
     background: #E2E8F0;
     color: #334155;

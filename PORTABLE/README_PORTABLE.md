@@ -1,25 +1,31 @@
-# 🐉 Radar del Dragón — Edición PORTABLE (Sin Red LAN)
+# Radar del Dragón — Edición portable
 
-Esta carpeta contiene una versión **100 % autónoma y ejecutable en cualquier equipo Windows**, compilada sin funcionalidades de servidor/cliente en red LAN y con el runtime C/C++ enlazado estáticamente (`+crt-static`).
+Busca, consulta y abre los archivos de este equipo desde una interfaz sencilla. La edición portable funciona localmente y conserva el catálogo de cada computadora por separado.
 
-## Contenido
+## Incluye
 
-- `dragon.exe`: ejecutable único autocontenido (`x86_64`, sin dependencias de VC++ Redistributable ni archivos web externos).
-- `iniciar_portable.bat`: lanzador rápido para abrir el Radar del Dragón en el equipo actual.
+- Búsqueda por nombre, ubicación, tipo y contenido de documentos compatibles.
+- Filtros para documentos, multimedia, imágenes, diseño, código y otros archivos.
+- Actualización del catálogo al iniciar y en revisiones periódicas.
+- Vista previa de documentos, imágenes, texto, audio, video y archivos comprimidos compatibles.
+- Acceso a la ubicación del archivo en el Explorador de Windows.
+- Uso local: los archivos y resultados se quedan en esta computadora.
 
-## Características de la edición PORTABLE
+## Cómo iniciarlo
 
-- **Solo ejecución local (`127.0.0.1`)**: deshabilita el parámetro `--lan`, rechaza enlaces de red externos (`0.0.0.0`) y excluye las rutas `/api/agent/launcher` y `/api/agent/binary`.
-- **Aislamiento automático por computadora**:
-  - Al ejecutarse en un equipo, guarda su índice privado (`.dragon-data/` y `.dragon-index/`).
-  - Si copias la carpeta o la llevas en una memoria USB a otra computadora, detecta automáticamente que el equipo cambió (`owner_machine`) y aísla el índice de la nueva PC en `%LOCALAPPDATA%\DragonRadar\<NOMBRE_EQUIPO>`, evitando mezclar archivos entre computadoras.
-- **Todas las funciones integradas incluidas**:
-  - Indexación incremental con checkpoints y validación de archivos nuevos/modificados/movidos/eliminados.
-  - Búsqueda híbrida, por contenido (BM25 + semántica), por nombre y **por extensión** (`.pdf`, `*.xlsx`, `ext:docx`, modo `EXTENSIÓN`).
-  - Vista previa integrada con **1 clic** y apertura de ubicación en el Explorador con **2 clics**, renderizado visual para Word, Excel y PowerPoint (más LibreOffice si está instalado en ese equipo, verificado al primer arranque).
+1. Copia la carpeta `PORTABLE` completa a una ubicación de tu elección.
+2. Abre `iniciar_portable.bat` o ejecuta `dragon.exe`.
+3. Se abrirá Radar del Dragón en tu navegador predeterminado.
+4. Deja abierta la ventana de inicio mientras utilices la aplicación. Para detenerla, cierra esa ventana.
 
-## Cómo usar
+La primera revisión puede tardar según el número de archivos y la velocidad de las unidades. Después, Radar mantiene el catálogo al día. Solo se incluyen archivos que tu cuenta puede leer; las ubicaciones protegidas pueden quedar fuera.
 
-1. Copia la carpeta `PORTABLE` completa (o solo `dragon.exe` + `iniciar_portable.bat`) a cualquier equipo Windows.
-2. Haz doble clic en **`iniciar_portable.bat`** (o directamente en **`dragon.exe`**).
-3. Se abrirá automáticamente tu navegador en `http://127.0.0.1:8088`.
+## Qué necesitas
+
+- Windows 10 u 11 de 64 bits.
+- Un equipo que permita ejecutar esta aplicación.
+- Espacio libre para el catálogo local.
+
+Esta edición no necesita conectarse a Internet para buscar en tus archivos ni comparte información con otros equipos. No incluye acceso por LAN. La disponibilidad de vistas previas de algunos documentos de Office puede mejorar si LibreOffice ya está instalado.
+
+Si Windows o la organización impiden ejecutar la aplicación, contacta al administrador del equipo. No cambies las protecciones del dispositivo para iniciar Radar.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import ipaddress
 import json
 import logging
@@ -14,6 +15,8 @@ import sys
 import threading
 import time
 import webbrowser
+import zipfile
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
 
@@ -38,11 +41,14 @@ LOG = logging.getLogger("dragon_radar.server")
 
 
 def setup_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    if sys.stderr is None:
+        logging.basicConfig(level=logging.INFO, handlers=[logging.NullHandler()])
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
 
 
 def load_site_config(config_path: Path) -> dict[str, Any]:
@@ -52,6 +58,11 @@ def load_site_config(config_path: Path) -> dict[str, Any]:
         "authorized_subnet": "172.23.174.0/24",
         "primary_host": "172.23.174.103",
         "proxy_host": "172.23.174.11",
+        "allowed_server_hosts": ["172.23.174.103", "172.23.174.11"],
+        "public_scheme": "http",
+        "public_port": 8092,
+        "local_agent_port": 8092,
+        "allowed_ui_origins": [],
         "shared_paths": [],
         "libreoffice_path": "",
         "sync_interval_minutes": 15,
@@ -92,6 +103,29 @@ def normalize_peer_ip(raw_ip: str | None) -> str:
     if "%" in ip:
         ip = ip.split("%", 1)[0]
     return ip or "127.0.0.1"
+
+
+def _validated_public_base(config: dict[str, Any], flask_request: Any, listen_port: int) -> str | None:
+    """Build a launcher URL only for a configured host; do not reflect arbitrary Host input."""
+    try:
+        parsed_host = urlsplit("//" + str(flask_request.host or ""))
+        hostname = (parsed_host.hostname or "").lower()
+        supplied_port = parsed_host.port
+    except ValueError:
+        return None
+    configured_hosts = config.get("allowed_server_hosts") or [config.get("primary_host"), config.get("proxy_host")]
+    allowed_hosts = {str(value).strip().lower() for value in configured_hosts if value}
+    if not hostname or hostname not in allowed_hosts:
+        return None
+    scheme = str(config.get("public_scheme") or flask_request.scheme or "http").lower()
+    if scheme not in {"http", "https"}:
+        return None
+    public_port = int(config.get("public_port") or supplied_port or listen_port)
+    permitted_ports = {listen_port, 80, 443, int(config.get("public_port") or listen_port)}
+    if supplied_port is not None and supplied_port not in permitted_ports:
+        return None
+    suffix = "" if (scheme == "http" and public_port == 80) or (scheme == "https" and public_port == 443) else f":{public_port}"
+    return f"{scheme}://{hostname}{suffix}"
 
 
 def normalize_explorer_path(raw_path: str) -> str:
@@ -245,6 +279,24 @@ def create_app(
 
     configured_lo = str(config.get("libreoffice_path") or "").strip()
     sync_interval_minutes = max(5, int(config.get("sync_interval_minutes") or 15))
+    configured_origins = {
+        str(item).strip().rstrip("/")
+        for item in (config.get("allowed_ui_origins") or [])
+        if isinstance(item, str) and str(item).strip()
+    }
+
+    def origin_allowed(origin: str | None) -> bool:
+        if not origin:
+            return False
+        normalized = origin.strip().rstrip("/")
+        if normalized in configured_origins:
+            return True
+        # Para uso local sin origen remoto configurado, permitir solo los alias de loopback.
+        try:
+            parsed = __import__("urllib.parse", fromlist=["urlsplit"]).urlsplit(normalized)
+            return parsed.scheme in {"http", "https"} and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+        except ValueError:
+            return False
     local_ips = get_local_ipv4_addresses()
 
     def get_peer_ip() -> str:
@@ -317,6 +369,7 @@ def create_app(
             "vector_count": with_content,
             "running_in_background": indexer.is_sync_running(),
             "phase": telem["phase"],
+            "last_error": telem["last_error"],
             "percent": telem["percent"],
             "target_index": telem["target_index"],
             "total_targets": telem["total_targets"],
@@ -331,8 +384,12 @@ def create_app(
             "skipped_files": telem["skipped_files"],
             "last_checkpoint": telem["last_checkpoint"],
             "last_sync_ms": telem["last_sync_ms"],
+            "last_duration_ms": telem["last_duration_ms"],
+            "access_errors": telem["access_errors"],
+            "index_scope": "Archivos legibles dentro de las carpetas detectadas en este equipo; no se envian rutas ni resultados al servidor LAN.",
             "initial_scan_completed": telem["initial_scan_completed"],
             "drives": telem["drives"],
+            "index_partial": any(str(d.get("status", "")).upper() == "PARTIAL" for d in telem["drives"]),
             "sync_interval_minutes": sync_interval_minutes,
             "office_pdf_available": soffice is not None,
             "libreoffice_installed": soffice is not None,
@@ -352,7 +409,16 @@ def create_app(
 
     @app.before_request
     def _enforce_cidr() -> Any:
+        origin = request.headers.get("Origin")
+        if not bind_lan and request.path.startswith("/api/") and origin and not origin_allowed(origin):
+            return jsonify({"error": "Origen web no autorizado para el agente local"}), 403
+        remote_api_allowlist = {"/api/server-info", "/api/agent/launcher", "/api/agent/package", "/api/agent/client-config"}
+        if request.path.startswith("/api/") and not is_client_local():
+            if request.path not in remote_api_allowlist:
+                return jsonify({"error": "Las API de datos solo están disponibles en el agente local de cada equipo"}), 403
         if request.method == "OPTIONS":
+            if origin and not origin_allowed(origin):
+                return Response("", status=403)
             resp = Response("", status=204)
             return resp
         if not is_peer_authorized():
@@ -366,10 +432,14 @@ def create_app(
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["Referrer-Policy"] = "no-referrer"
         resp.headers["X-Frame-Options"] = "SAMEORIGIN"
-        resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        resp.headers["Access-Control-Allow-Headers"] = "*"
-        resp.headers["Access-Control-Allow-Private-Network"] = "true"
+        origin = request.headers.get("Origin")
+        if origin and origin_allowed(origin):
+            resp.headers["Access-Control-Allow-Origin"] = origin.rstrip("/")
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Dragon-Token"
+            if request.headers.get("Access-Control-Request-Private-Network", "").lower() == "true":
+                resp.headers["Access-Control-Allow-Private-Network"] = "true"
         if resp.mimetype == "text/html":
             resp.headers["Content-Security-Policy"] = (
                 "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
@@ -411,6 +481,7 @@ def create_app(
 
     @app.route("/api/server-info")
     def server_info() -> Any:
+        remote_local_agent_view = not is_client_local()
         return jsonify(
             {
                 "app": "dragon-radar",
@@ -422,10 +493,10 @@ def create_app(
                 "bind_lan": bind_lan,
                 "lan_enabled": True,
                 "portable_edition": False,
-                "lan_mode": lan_mode,
+                "lan_mode": "local_agent" if remote_local_agent_view else lan_mode,
                 "authorized_subnet": authorized_subnet_str,
-                "shared_server_active": shared_server_active,
-                "shared_paths_count": len(canonical_shared_roots),
+                "shared_server_active": bool(shared_server_active and not remote_local_agent_view),
+                "shared_paths_count": len(canonical_shared_roots) if not remote_local_agent_view else 0,
                 "client_is_local": is_client_local(),
                 "machine_name": machine_name,
             }
@@ -457,13 +528,6 @@ def create_app(
     def api_index_validate() -> Any:
         telem = indexer.get_telemetry_snapshot()
         total_files, with_content = indexer.get_counts()
-        force_sync = request.args.get("force") in {"1", "true"}
-        incomplete = (not telem["initial_scan_completed"]) or (total_files == 0)
-        resumed = False
-        if (incomplete or force_sync) and not indexer.is_sync_running():
-            resumed = indexer.start_background_sync()
-            telem = indexer.get_telemetry_snapshot()
-
         pending_targets = max(0, int(telem["total_targets"]) - int(telem["target_index"]))
         complete = bool(telem["initial_scan_completed"] and not indexer.is_sync_running() and telem["phase"] == "READY")
         return jsonify(
@@ -472,11 +536,15 @@ def create_app(
                 "machine_name": machine_name,
                 "complete": complete,
                 "phase": telem["phase"],
+                "partial": any(str(d.get("status", "")).upper() == "PARTIAL" for d in telem["drives"]),
+                "last_error": telem["last_error"],
                 "pending_targets": pending_targets,
-                "resumed_just_now": resumed,
+                "resumed_just_now": False,
                 "redb_records": total_files,
                 "vector_count": with_content,
                 "last_checkpoint": telem["last_checkpoint"],
+                "last_duration_ms": telem["last_duration_ms"],
+                "access_errors": telem["access_errors"],
             }
         )
 
@@ -603,19 +671,65 @@ def create_app(
 
     @app.route("/api/agent/launcher")
     def api_agent_launcher() -> Any:
+        public_base = _validated_public_base(config, request, listen_port)
+        if not public_base:
+            return jsonify({"error": "El host de acceso no está en allowed_server_hosts"}), 400
         bat_content = (
             "@echo off\r\n"
             "setlocal\r\n"
-            "title Radar del Dragon - Servicio Local Python\r\n"
-            "echo Para ejecutar Radar del Dragon localmente sin ejecutables .exe,\r\n"
-            f"echo ejecute 'servidor local.bat' en la carpeta del proyecto (puerto {listen_port}).\r\n"
-            "pause\r\n"
+            "title Activar Radar del Dragon en este equipo\r\n"
+            f"set \"DRAGON_RADAR_BASE={public_base}\"\r\n"
+            "powershell.exe -NoProfile -Command \"$ErrorActionPreference='Stop'; $base=$env:DRAGON_RADAR_BASE; $tmp=Join-Path $env:TEMP ('DragonRadar-'+[guid]::NewGuid().ToString('N')); New-Item -ItemType Directory -Path $tmp -Force | Out-Null; $zip=Join-Path $tmp 'agent.zip'; Invoke-WebRequest -UseBasicParsing -Uri ($base+'/api/agent/package') -OutFile $zip; Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force; $activationArgs=@('-ServerUrl',$base); if($env:DRAGON_RADAR_WHEELHOUSE){$activationArgs+=@('-WheelhousePath',$env:DRAGON_RADAR_WHEELHOUSE)}; & (Join-Path $tmp 'activate-client.ps1') @activationArgs\"\r\n"
+            "if errorlevel 1 pause\r\n"
         )
         return Response(
             bat_content.encode("utf-8"),
             mimetype="application/octet-stream",
             headers={"Content-Disposition": 'attachment; filename="Activar_Radar_Local.bat"'},
         )
+
+    @app.route("/api/agent/package")
+    def api_agent_package() -> Any:
+        package_files = [
+            ("server.py", ROOT_DIR / "server.py"),
+            ("radar_indexer.py", ROOT_DIR / "radar_indexer.py"),
+            ("radar_preview.py", ROOT_DIR / "radar_preview.py"),
+            ("requirements.txt", ROOT_DIR / "requirements.txt"),
+            ("activate-client.ps1", ROOT_DIR / "deploy" / "activate-client.ps1"),
+            ("install-client-dependencies.ps1", ROOT_DIR / "deploy" / "install-client-dependencies.ps1"),
+            ("ui/index.html", UI_DIR / "index.html"),
+            ("ui/styles.css", UI_DIR / "styles.css"),
+            ("ui/radar.js", UI_DIR / "radar.js"),
+        ]
+        missing = [str(path) for _, path in package_files if not path.is_file()]
+        if missing:
+            return jsonify({"error": "Paquete de cliente incompleto", "missing": missing}), 503
+        bundle = io.BytesIO()
+        with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for arcname, path in package_files:
+                archive.write(path, arcname)
+        bundle.seek(0)
+        return send_file(bundle, mimetype="application/zip", as_attachment=True, download_name="radar-dragon-python-agent.zip")
+
+    @app.route("/api/agent/client-config")
+    def api_agent_client_config() -> Any:
+        scheme = str(config.get("public_scheme") or "http").strip().lower()
+        if scheme not in {"http", "https"}:
+            scheme = "http"
+        port = int(config.get("public_port") or listen_port)
+        explicit = config.get("allowed_ui_origins") or []
+        if explicit:
+            origins = [str(value).strip().rstrip("/") for value in explicit if isinstance(value, str)]
+        else:
+            hosts = config.get("allowed_server_hosts") or [config.get("primary_host"), config.get("proxy_host")]
+            origins = []
+            for host in hosts:
+                host = str(host or "").strip()
+                if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+                    continue
+                suffix = "" if (scheme == "http" and port == 80) or (scheme == "https" and port == 443) else f":{port}"
+                origins.append(f"{scheme}://{host}{suffix}")
+        return jsonify({"port": int(config.get("local_agent_port") or 8092), "allowed_ui_origins": origins})
 
     @app.route("/api/shutdown", methods=["POST"])
     def api_shutdown() -> Any:
@@ -658,6 +772,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--strict-port", action="store_true", help="Fallar si el puerto ya esta ocupado")
     parser.add_argument("--sync-only", action="store_true", help="Ejecutar indexacion incremental y salir")
     parser.add_argument("--db-path", default="", help="Ruta opcional para base SQLite FTS5")
+    parser.add_argument("--data-dir", default="", help="Carpeta local para base de datos, caché y logs")
     return parser.parse_args(argv)
 
 
@@ -683,13 +798,28 @@ def main(argv: list[str] | None = None) -> int:
             if p.is_dir():
                 shared_roots.append(p)
 
+    if args.data_dir:
+        data_dir = Path(args.data_dir).expanduser().resolve()
+    elif args.local:
+        local_app_data = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        data_dir = local_app_data / "RadarDelDragon" / "data"
+    else:
+        sub_name = "SHARED_SERVER" if lan_mode == "shared_server" else machine_name
+        data_dir = ROOT_DIR / ".dragon-data" / sub_name
+    data_dir.mkdir(parents=True, exist_ok=True)
+
     if args.db_path:
         db_path = Path(args.db_path)
     else:
-        sub_name = "SHARED_SERVER" if lan_mode == "shared_server" else machine_name
-        db_path = ROOT_DIR / ".dragon-data" / sub_name / "radar_service.sqlite3"
+        db_path = data_dir / "radar_service.sqlite3"
 
-    cache_dir = ROOT_DIR / ".dragon-data" / "office-pdf-cache"
+    cache_dir = data_dir / "office-pdf-cache"
+    try:
+        file_handler = logging.FileHandler(data_dir / "radar-service.log", encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        logging.getLogger().addHandler(file_handler)
+    except OSError as exc:
+        LOG.warning("No se pudo activar el registro local en %s: %s", data_dir, exc)
     storage_mode = "SHARED_SERVER" if lan_mode == "shared_server" else "LOCAL_SERVICE"
 
     indexer = RadarIndexer(
