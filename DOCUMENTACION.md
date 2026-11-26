@@ -1,122 +1,83 @@
-# 📘 Documentación Técnica — Radar del Dragón (Dragon Radar Tool)
+# Documentación del proyecto
 
-Documento de referencia técnica sobre arquitectura, motores de almacenamiento e indexación, vista previa documental, perfiles de compilación (`estándar` vs `PORTABLE`) y flujo de publicación en GitHub Desktop.
+## 1. Propósito y variantes
 
----
+Radar del Dragón es una herramienta local para indexar y localizar archivos. La entrega de cliente LAN preparada en este proyecto utiliza Python y scripts de PowerShell. El código Rust y los paquetes portables antiguos siguen en el repositorio como variantes históricas/alternativas; no forman parte de la instalación Python offline descrita aquí y su ejecución debe aprobarse por separado.
 
-## 1. Arquitectura del Workspace Rust
-
-| Crate | Responsabilidad | Archivos Clave |
+| Componente | Función | Ubicación |
 | --- | --- | --- |
-| `dragon-core` | Estructuras (`FileRecord`, `SearchMode`, `FileCategory`), normalización de extensiones (`extract_extension_lower`) y detección de rutas ruidosas (`is_noisy_build_or_cache_path`). | `crates/dragon-core/src/lib.rs` |
-| `dragon-mft` | Escaneo rápido NTFS MFT en Windows con fallback paralelo `jwalk` y descubrimiento de ubicaciones de usuario (`discover_local_user_targets`). | `crates/dragon-mft/src/*` |
-| `dragon-storage` | Persistencia ACID en `redb`: metadatos, rutas, checkpoints incrementales, ajustes persistentes e **índice invertido de extensiones** (`extension_index`). | `crates/dragon-storage/src/lib.rs` |
-| `dragon-index` | Índice invertido BM25 en Tantivy para texto completo de documentos (`FileCategory::Document`) con expansión por prefijos y plegado de acentos. | `crates/dragon-index/src/lib.rs` |
-| `dragon-extract` | Extractores de texto y renderizadores visuales OOXML para Word, Excel, PowerPoint, PDF y archivos planos/código. | `crates/dragon-extract/src/lib.rs`, `office.rs`, `office_visual.rs`, `pdf.rs`, `text.rs` |
-| `dragon-ai` | Embeddings locales (`Model2Vec` o `HashEmbedder`), almacén vectorial y ranking híbrido RRF. | `crates/dragon-ai/src/*` |
-| `dragon-mcp` | Servidor stdio JSON-RPC (Model Context Protocol). | `crates/dragon-mcp/src/*` |
-| `dragon-service` | Integración de servicio Windows / Pipe MFT. | `crates/dragon-service/src/*` |
-| `dragon-cli` | Binario `dragon`: CLI, indexador incremental (`indexer.rs`) y servidor HTTP del HUD (`ui_server.rs`) con `index.html`, `styles.css` y `radar.js` embebidos vía `include_str!`. | `crates/dragon-cli/src/main.rs`, `indexer.rs`, `ui_server.rs` |
+| Aplicación local | API del agente, búsqueda, indexación y vista previa | `server.py`, `radar_indexer.py`, `radar_preview.py` |
+| Interfaz | Página, lógica de búsqueda y estilos | `ui/` |
+| Configuración de ejemplo | Valores de referencia para el servicio | `config/site_config.example.json` |
+| Activación cliente | Copia la app al perfil, prepara entorno Python y activa el agente local | `deploy/activate-client.ps1` |
+| Dependencias | Comprobación e instalación desde índice o wheelhouse offline | `deploy/install-client-dependencies.ps1`, `requirements.txt` |
+| Instalación offline completa | Verifica paquete, firma de Python, prepara Python y activa el cliente | `deploy/install-client-offline.ps1` |
+| Constructor offline | Ensambla runtime, aplicación y wheels en un ZIP autocontenido | `deploy/build-full-offline-client.ps1` |
 
----
+El paquete actual está en `dist/Radar-del-Dragon-Cliente-Offline-Python314-win-x64.zip`. Se generó para Windows x64 con Python 3.14.10 y las dependencias fijadas en `requirements.txt`. Si se cambia Python o cualquier requisito, hay que reconstruir el wheelhouse y el ZIP y volver a validar el paquete.
 
-## 2. Almacenamiento en `redb` (`radar.redb`) y Búsqueda por Extensión
+## 2. Instalación y datos locales
 
-### Tablas en `DragonStorage`
-- `files_metadata` (`u64 -> &[u8]`): `FileRecord` serializado en JSON por ID MFT/hash.
-- `path_to_id` (`&str -> u64`): índice ruta absoluta -> ID.
-- `extension_index` (`(&str, u64) -> ()`): índice B-Tree ordenado por `(extensión_minúscula_sin_punto, doc_id)`.
-- `index_state` (`&str -> &[u8]`): huellas `IndexedFileState` (tamaño, `modified_ms`, `doc_id`) para sincronización incremental y conciliación de archivos movidos/borrados.
-- `settings` (`&str -> &str`): configuración persistente del equipo.
+1. Extraer el paquete completo en una carpeta local con permisos de escritura del usuario.
+2. Ejecutar `INSTALL_OFFLINE.bat`.
+3. El instalador revisa `MANIFEST-SHA256.txt`, valida la firma Authenticode del instalador Python y usa las ruedas de `wheelhouse` sin conexión.
+4. La activación copia la aplicación a `%LOCALAPPDATA%\RadarDelDragon\app`, prepara un entorno virtual y registra una tarea por usuario cuando Windows lo permite. Si el registro de tarea está bloqueado, el script intenta mantener el agente solo durante la sesión actual.
+5. La configuración, base SQLite, índices auxiliares, registros y reporte de dependencias se guardan bajo `%LOCALAPPDATA%\RadarDelDragon\data` y `config` dentro del perfil del usuario, según el componente.
+6. El agente local escucha en `127.0.0.1:8092`; la interfaz se abre en `http://127.0.0.1:8092`.
 
-### Reglas y mantenimiento de `extension_index`
-1. **Backfill automático (`rebuild_extension_index`)**: al ejecutar `DragonStorage::open()`, si falta `extension_index_version = "1"` en `settings`, se reconstruye `extension_index` automáticamente desde todos los registros no-directorio de `files_metadata`.
-2. **Actualización atómica**: `insert_batch` elimina la entrada previa si un archivo existente cambió de extensión e inserta `(ext, doc_id)`; `remove_by_paths` purga las entradas eliminadas.
-3. **Consultas disponibles**:
-   - `extension_exists(ext)`: consulta en $O(\log N)$ si hay al menos un archivo con esa extensión.
-   - `list_top_extensions(prefix_filter, limit)`: agrupa y ordena extensiones por cantidad de archivos sin deserializar `files_metadata`.
-   - `search_by_extension(extensions, name_tokens, category_filter, allow_prefix_fallback, limit)`: escanea por rango en `extension_index`, soporta múltiples extensiones y fallback por prefijo, aplica filtros opcionales por tokens en nombre/ruta y penaliza rutas de caché/build (`target\debug`, `node_modules`, `AppData`, `.git`, etc.).
+La ejecución está diseñada para no requerir elevación. Esto no garantiza que cada entorno corporativo permita Python, PowerShell, tareas por usuario, localhost o los módulos nativos. Si una política bloquea alguno, detener la instalación y solicitar el procedimiento aprobado por TI. Ningún script cambia ExecutionPolicy, Firewall o controles de endpoint.
 
-### Sintaxis de búsqueda soportada en `/api/search`
-- **Modo `extension` (botón `EXTENSIÓN`)**:
-  - `pdf`, `.pdf`, `*.pdf`, `ext:pdf`, `tipo:xlsx`
-  - Listas múltiples: `.pdf, .docx`, `xlsx csv`
-  - Extensión + filtro textual de nombre/ruta: `pdf contrato`, `ext:xlsx presupuesto`
-  - Coincidencia por prefijo mientras se escribe: `xl` -> `.xls`, `.xlsx`, `.xlsm`
-- **Modos generales (`all` / `HÍBRIDO`, `documents`, `media`, `design`, `content`, `filename`)**:
-  - Filtros explícitos (`.pdf`, `*.xlsx`, `ext:docx`, `contrato .pdf`): acotan directamente al índice de extensiones (y filtran también resultados BM25/semánticos cuando hay texto adicional).
-  - Token único coincidente con una extensión indexada (ej. `xlsx`, `dwg`, `mp4`): combina coincidencias de nombre/contenido con archivos recuperados desde `extension_index`.
+Para activar desde un servidor LAN después de que el paquete/runtimes estén aprobados, el instalador de cliente puede recibir URL del servidor y ubicación del wheelhouse. La URL entregada al navegador y los orígenes permitidos deben coincidir con la configuración real. No usar listas CORS abiertas ni asumir que las IP de ejemplo siguen vigentes.
 
----
+## 3. Generación del paquete y control de integridad
 
-## 3. Vista Previa Documental y Regla de LibreOffice
+El constructor `deploy/build-full-offline-client.ps1` lee el instalador oficial ubicado por defecto en `dist/python-3.14.10-amd64.exe`, verifica firma y copia:
 
-### Flujo de interacción en la UI (`ui/index.html`, `ui/radar.js`, `ui/styles.css`)
-- **1 clic** en fila o esfera del radar: selecciona el elemento y solicita `GET /api/preview?file=...`.
-- **2 clics** en fila (o `Enter`): solicita `GET /api/open?file=...` para abrir el Explorador de Windows seleccionando el archivo (`explorer.exe /select,"..."`).
-- Se eliminó por completo la integración y el botón nativo de QuickLook (`/api/quicklook` y `#previewQuickLookBtn` / `#modalQuickLookBtn`).
+- `Python/python-3.14.10-amd64.exe`.
+- `RadarAgent/` con servidor Python, indexador, vista previa, UI, requisitos y scripts.
+- `wheelhouse/` con ruedas y `WHEELS-SHA256SUMS.txt`.
+- `install-client-offline.ps1`, `INSTALL_OFFLINE.bat` y `README-INSTALACION.txt`.
+- `MANIFEST-SHA256.txt` para cada archivo del paquete y un `.sha256.txt` externo para el ZIP.
 
-### Renderizado de Office (`crates/dragon-extract/src/office_visual.rs`)
-- **Word (`WordVisualModel`)**: parsea `word/document.xml`, estilos, encabezados, negritas/itálicas/subrayado, colores, alineación, listas, tablas e imágenes embebidas referenciadas mediante `word/_rels/document.xml.rels` servidas vía `/api/zip-asset`.
-- **Excel (`ExcelVisualModel`)**: parsea `xl/workbook.xml`, `sharedStrings.xml`, hojas de cálculo y celdas combinadas (`mergeCell`), renderizando cuadrícula con cabeceras alfabéticas y selector de hojas.
-- **PowerPoint (`PptxVisualModel`)**: parsea `ppt/presentation.xml`, diapositivas (`slides/slide*.xml`), relaciones de imágenes, formas posicionadas y notas del orador en formato panorámico 16:9.
-- **Conversión Office -> PDF con caché (`/api/office-pdf`)**: si LibreOffice está instalado, convierte bajo demanda con perfil aislado y caché FNV-1a en `%TEMP%\dragon-office-preview\<hash>.pdf` con soporte HTTP `Range`.
+Comando:
 
-### Comprobación de LibreOffice en primera ejecución
-- En `run_ui_server`, se invoca `ensure_libreoffice_first_run_check(&state.storage)` (clave `libreoffice_first_run_checked_v1` y `libreoffice_detected_path_v1` en `settings`).
-- `find_soffice_exe()` inspecciona `ProgramFiles`, `ProgramFiles(x86)`, `LOCALAPPDATA\Programs\LibreOffice\program` y `PATH` buscando `soffice.com` / `soffice.exe`.
-- `/api/status` expone `libreoffice_installed`, `libreoffice_first_run_checked` y `libreoffice_path`. Si `libreoffice_installed == false`, la UI muestra el banner `#libreofficeNoticeBanner` (ocultable por sesión) informando que el visor OOXML sigue activo pero sin renderizado PDF exacto.
-
----
-
-## 4. Perfiles de Compilación: Estándar vs `PORTABLE` (Sin LAN)
-
-El crate `crates/dragon-cli/Cargo.toml` define la feature:
-
-```toml
-[features]
-default = ["lan"]
-lan = []
-```
-
-| Aspecto | Edición Estándar (`.\dragon.exe`) | Edición PORTABLE (`.\PORTABLE\dragon.exe`) |
-| --- | --- | --- |
-| Comando Cargo | `cargo build --release --bin dragon` | `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --bin dragon --no-default-features --target-dir target\portable` |
-| Feature `lan` | Habilitada | Deshabilitada |
-| Enlace de red HTTP | Local (`127.0.0.1`) o LAN (`--lan` / `0.0.0.0`) | Exclusivamente `127.0.0.1` (loopback) |
-| Endpoints `/api/agent/*` | Activos (`/api/agent/launcher`, `/api/agent/binary`) | Eliminados en compilación (`404 Not Found`) |
-| Dependencia CRT MSVC | Dinámica estándar | Enlace estático (`+crt-static`, sin requerir VC++ Redistributable) |
-| Estado en `/api/status` | `"lan_enabled": true, "portable_edition": false` | `"lan_enabled": false, "portable_edition": true` |
-
-### Uso del script `compilador.ps1`
 ```powershell
-.\compilador.ps1                # Valida JS/tests, compila dragon.exe y PORTABLE\dragon.exe, y valida pesos GitHub
-.\compilador.ps1 -KillRunning   # Cierra instancias previas de dragon.exe antes de compilar
-.\compilador.ps1 -SoloEstandar  # Solo compila .\dragon.exe
-.\compilador.ps1 -SoloPortable  # Solo compila .\PORTABLE\dragon.exe
-.\compilador.ps1 -SkipTests     # Compila sin re-ejecutar cargo test
+.\deploy\build-full-offline-client.ps1
 ```
 
----
+El constructor no reemplaza una carpeta/ZIP previo. Para otro runtime aprobado se puede pasar `-PythonInstallerPath`; hay que comprobar que el wheelhouse corresponda a la misma versión y arquitectura antes de empaquetar. El manifiesto detecta corrupción accidental, pero puede ser reemplazado junto con los archivos; para autenticidad, TI debe firmar/publicar el paquete o comunicar el hash por un canal confiable.
 
-## 5. Paquete Instalador Offline y Modo LAN Híbrido (`config/site_config.json`)
+El ZIP viejo `client-wheelhouse-py314-win_amd64.zip` contiene únicamente ruedas, requirements, instrucciones y versiones del instalador Python. No es el paquete de instalación completo. Desplegar el ZIP nuevo cuyo nombre incluye `Cliente-Offline-Python314`.
 
-- **Puerto oficial**: `8092` (configurable en `config/site_config.json`; el lanzador `Iniciar-Radar.ps1` busca libre entre `8092` y `8101` verificando `GET /health` -> `{"app": "dragon-radar", "status": "ok"}`).
-- **Configuración híbrida (`config/site_config.example.json` -> `config/site_config.json`)**:
-  - `lan_mode = "local_agent"` *(predeterminado)*: las peticiones remotas a `/api/status`, `/api/search`, `/api/preview`, `/api/raw`, `/api/download`, `/api/open` se bloquean (`403`) en el anfitrión; los clientes LAN descargan el activador local y buscan exclusivamente en sus propios discos.
-  - `lan_mode = "shared_server"`: indexa exclusivamente `shared_paths` en un índice aislado (`.dragon-shared-data` / `.dragon-shared-index`), valida contención canónica de rutas en cada petición remota, deshabilita `/api/open` remoto y habilita `GET /api/download` para descarga directa desde el navegador.
-  - `libreoffice_path`: ruta opcional explícita a `soffice.com` / `soffice.exe`.
-- **Interfaz 100 % offline**: sin referencias a Google Fonts ni CDNs externos.
-- **Constructor del instalador offline**:
-  ```powershell
-  .\deploy\build-offline-package.ps1
-  ```
-  Genera `dist\Radar-del-Dragon-Offline-1.3.0-win-x64.zip` + `.sha256.txt` con binario `+crt-static`, `INSTALAR.bat`/`INSTALAR.ps1`, `Iniciar-Radar.ps1`, `Desinstalar-Radar.ps1` y `herramientas\configure-firewall.ps1`.
+## 4. Arquitectura LAN y privacidad esperada
 
----
+En el diseño `local_agent`, principal y respaldo/proxy sirven la interfaz y los recursos de activación. Cada cliente busca en su propio agente local. El objetivo es mantener la base de índice, rutas, consultas, fragmentos, vistas previas y resultados en el equipo cliente.
 
-## 6. Política de Git / GitHub Desktop y Límites de Peso
+La separación debe confirmarse en la LAN con captura de red, herramientas del navegador y logs del proxy/servidor. La arquitectura no queda demostrada solo porque la configuración diga `local_agent`: se debe verificar que las solicitudes de datos del navegador apunten a `127.0.0.1` y que ningún proxy retransmita esas APIs hacia servidores.
 
-- `.gitignore` ignora `/target/` (incluyendo `target/portable/`), bases de runtime (`.dragon-data/`, `.dragon-index/`, `.dragon-models/`, `PORTABLE/.dragon-data/`, `PORTABLE/.dragon-index/`, `PORTABLE/.dragon-models/`) y ejecutables temporales `*.exe`, **excepto** `!PORTABLE/dragon.exe`.
-- GitHub establece una advertencia en **50 MB** y un límite estricto de rechazo en **100 MB** por archivo individual.
-- `compilador.ps1` audita todos los archivos trackeables y no ignorados (`git ls-files` + `git ls-files --others --exclude-standard`) para garantizar que `PORTABLE/dragon.exe` y el resto del repositorio estén muy por debajo de ambos límites antes de hacer commit y push en **GitHub Desktop**.
+Al desplegar:
+
+- Confirmar con TI principal, respaldo, DNS/VIP, protocolo, puerto, certificados, subred y reglas de Firewall actuales.
+- Servir una versión compatible de UI/activador en principal y respaldo.
+- Configurar orígenes permitidos exactos según el origen real que ve el navegador.
+- No proxyar al servidor central las API de búsqueda, estado del índice, apertura, descarga o vista previa del cliente.
+- Confirmar desde otro equipo que el servidor rechaza APIs de datos remotas en `local_agent`.
+- No habilitar `shared_server` para esta necesidad: ese modo implica búsquedas sobre rutas del servidor deliberadamente compartidas.
+
+Las IP `172.23.174.103` y `172.23.174.11` en los archivos del proyecto son valores de referencia heredados, no valores confirmados. La configuración operativa se debe cotejar con TI antes de ejecutar cambios.
+
+## 5. Límites administrativos y de seguridad
+
+- El instalador Python oficial del ZIP tiene firma Authenticode de Python Software Foundation comprobada al construir el paquete. Verificar de nuevo la firma y el hash antes de despliegues sensibles.
+- Instalación Python por usuario suele evitar UAC, pero CrowdStrike, AppLocker, WDAC, GPO o permisos locales pueden impedirla. No sortear esos controles.
+- Crear un servicio de Windows, tarea `SYSTEM`, regla de Firewall, proxy inverso o configuración TLS de servidores requiere aprobación y normalmente privilegios administrativos. Son tareas de infraestructura distintas de la activación local.
+- No distribuir ni ejecutar ejecutables Rust no firmados cuando la política de endpoint los bloquea. El instalador no elimina ni modifica ejecutables preexistentes.
+- Evitar copiar bases de datos, índices, resultados, configuraciones locales y registros de pruebas a los ZIP de distribución o a servidores centrales.
+
+## 6. Validación y recuperación
+
+`INSTRUCCIONES_VALIDACION_CODEX.txt` contiene una secuencia independiente para que otro cliente Codex inspeccione el repositorio, revise el paquete, ejecute comprobaciones seguras y deje un informe sin asumir acceso a la LAN. `INSTRUCCIONES_ANTIGRAVITY_LAN.txt` describe el trabajo de integración y aceptación que solo se completa en la red corporativa.
+
+Antes de desplegar a más equipos, registrar versiones y hashes, equipo/usuario piloto, alcance de indexación, duración, cantidad de elementos, memoria, errores de acceso, salud tras reinicio, comportamiento de failover y evidencia de que no se enviaron datos de búsqueda a los servidores. Si falla una prueba de privacidad, recuperación o política de seguridad, detener el rollout.
+
+Para retirar un cliente, detener la tarea de usuario si existe, cerrar el proceso local y retirar `%LOCALAPPDATA%\RadarDelDragon` siguiendo la política de retención de la organización. No eliminar datos de usuario sin aprobación y copia si se requiere conservar el índice.

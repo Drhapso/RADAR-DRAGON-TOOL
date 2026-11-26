@@ -1,0 +1,174 @@
+RADAR DEL DRAGON - INSTRUCCIONES PARA VALIDACION CON OTRO CODEX
+================================================================
+
+OBJETIVO
+--------
+Inspeccionar el repositorio y validar el paquete cliente Python offline de forma
+reproducible, separando lo que se puede comprobar fuera de la LAN de lo que exige
+los servidores y equipos piloto. No desplegar cambios de red ni modificar archivos
+de produccion. Este documento es un plan de validacion, no evidencia de que las
+pruebas ya se hayan ejecutado.
+
+FUENTES DE CONTEXTO
+-------------------
+Leer en este orden:
+1. README.md
+2. DOCUMENTACION.md
+3. INSTRUCCIONES_ANTIGRAVITY_LAN.txt (pruebas que requieren la LAN)
+4. requirements.txt, config/site_config.example.json y los scripts deploy usados
+   por el paquete offline.
+5. Este archivo.
+
+La entrega offline completa actual es:
+dist\Radar-del-Dragon-Cliente-Offline-Python314-win-x64.zip
+Su hash externo se encuentra en el archivo .sha256.txt con el mismo nombre.
+El ZIP client-wheelhouse-py314-win_amd64.zip es solo un paquete de dependencias;
+no confundirlo con la entrega completa.
+
+REGLAS PARA CODEX
+-----------------
+- Comenzar por `git status --short`, rama/commit y diferencias. No descartar ni
+  sobrescribir cambios que ya existan; no limpiar `dist`, indices o DB.
+- No acceder a otros perfiles o archivos privados. No copiar datos de usuario,
+  indices, bases SQLite, credenciales, logs o configuraciones locales al informe.
+- No ejecutar dragon.exe ni paquetes Rust/portable. La validacion corresponde a la
+  ruta Python sin exe de aplicacion.
+- No instalar el paquete en un equipo de trabajo ni cambiar el Python global sin
+  autorizacion del dueño del equipo. La instalacion real corresponde al piloto
+  aprobado y debe usar el ZIP completo.
+- No cambiar ExecutionPolicy, Defender, CrowdStrike, AppLocker, WDAC, Firewall,
+  proxy, DNS, TLS, tareas SYSTEM o permisos. No usar modos de bypass ni renombrar
+  componentes bloqueados.
+- No asumir que las IP de ejemplo son actuales ni que hay acceso a la LAN.
+- Mantener separadas las conclusiones: REVISADO EN REPOSITORIO, VALIDADO EN ESTE
+  EQUIPO y PENDIENTE EN LAN.
+
+ETAPA 1: INSPECCION ESTATICA
+----------------------------
+1. Anotar raiz del repo, commit/branch y modificaciones preexistentes.
+2. Inspeccionar el flujo de instalacion en:
+   - deploy/build-full-offline-client.ps1
+   - deploy/install-client-offline.ps1
+   - deploy/activate-client.ps1
+   - deploy/install-client-dependencies.ps1
+   - server.py, radar_indexer.py, radar_preview.py, ui/ y requirements.txt
+3. Verificar que el instalador offline no agregue ExecutionPolicy Bypass, no pida
+   elevacion, no instale servicios SYSTEM ni modifique Firewall o CrowdStrike.
+4. Verificar los destinos de DB, config, venv, logs y puertos. Confirmar en codigo
+   que el cliente local usa loopback y perfil local del usuario.
+5. Seguir el flujo de fetch de configuracion y las llamadas de UI para comprobar
+   que los endpoints de consulta/preview/open se dirigen al agente local. Registrar
+   cualquier duda como pendiente; la prueba estatica no demuestra el trafico real.
+6. Revisar que configuraciones privadas, DB, indices y resultados no se copien al
+   constructor ni entren al ZIP.
+
+ETAPA 2: VALIDACION DEL PAQUETE (SIN INSTALAR)
+----------------------------------------------
+Ejecutar en PowerShell desde la raiz del proyecto. Sustituir $ProjectRoot si es
+necesario; no ejecutar scripts incluidos en el ZIP durante esta etapa.
+
+```powershell
+$ProjectRoot = (Get-Location).Path
+$ZipPath = Join-Path $ProjectRoot 'dist\Radar-del-Dragon-Cliente-Offline-Python314-win-x64.zip'
+$Sidecar = $ZipPath + '.sha256.txt'
+Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256
+Get-Content -LiteralPath $Sidecar
+Get-AuthenticodeSignature -LiteralPath (Join-Path $ProjectRoot 'dist\python-3.14.10-amd64.exe') |
+  Format-List Status,SignerCertificate
+```
+
+Comparar manualmente el SHA256 calculado con el sidecar obtenido por un canal
+confiable. Status debe ser Valid y el sujeto debe corresponder a Python Software
+Foundation. Si el archivo es distinto, falta, la firma no valida o el hash del
+canal confiable discrepa, parar y registrar FAIL.
+
+Listar los miembros del ZIP y comprobar que esten presentes:
+- MANIFEST-SHA256.txt, README-INSTALACION.txt, INSTALL_OFFLINE.bat y
+  install-client-offline.ps1.
+- Python\python-3.14.10-amd64.exe.
+- RadarAgent\server.py, radar_indexer.py, radar_preview.py, requirements.txt,
+  activate-client.ps1, install-client-dependencies.ps1, ui\ y config\.
+- wheelhouse\WHEELS-SHA256SUMS.txt y las 14 ruedas correspondientes a requirements
+  y sus dependencias transitivas.
+- Ningun .dragon-data, .dragon-index, DB, credencial, log de usuario, archivo
+  site_config.json privado ni ruta/resultado de un equipo real.
+
+Extraer el ZIP a una carpeta temporal controlada (no ejecutar nada) y calcular el
+SHA256 de cada ruta indicada por MANIFEST-SHA256.txt. Confirmar igualdad, ausencia
+de rutas absolutas o `..`, que el manifiesto cubre todos los archivos salvo a si
+mismo y que no haya archivos sin declarar. Comprobar tambien el manifiesto interno
+de wheelhouse. No editar archivos extraidos antes de esta comprobacion.
+
+ETAPA 3: VALIDACION ESTATICA DE SCRIPTS
+---------------------------------------
+Parsear con el parser de PowerShell los scripts incluidos y revisar errores de
+sintaxis. Comprobar requisitos Python sin instalarlos. Si el proyecto tiene pruebas
+existentes de servicio, leerlas primero y determinar si ejecutarlas crea datos o
+abre puertos. No añadir ni ejecutar pruebas destructivas.
+
+Una comprobacion de sintaxis Python sin generar bytecode es:
+
+```powershell
+python -B -c "import ast,pathlib; files=['server.py','radar_indexer.py','radar_preview.py']; [ast.parse(pathlib.Path(f).read_text(encoding='utf-8')) for f in files]; print('Python syntax OK')"
+```
+
+Si la codificacion real del archivo no es UTF-8, detectar la codificacion y
+documentar el ajuste en vez de alterar el fuente. `python -B` evita escribir .pyc.
+No instalar requisitos en el Python global. Una resolucion pip offline, si se hace,
+debe ser un dry-run y usar exclusivamente wheelhouse del paquete.
+
+ETAPA 4: PRUEBA DE INSTALACION (SOLO PILOTO AUTORIZADO)
+-------------------------------------------------------
+No ejecutar esta etapa en el equipo actual sin autorizacion explicita del
+responsable del piloto. En un Windows x64 de pruebas aprobado:
+
+1. Guardar version de Windows, usuario estandar, estado de Python, politicas y
+   estado de CrowdStrike/Defender reportado por TI. No suspender el endpoint.
+2. Verificar el hash del ZIP por canal confiable y extraerlo localmente.
+3. Ejecutar INSTALL_OFFLINE.bat desde la cuenta estandar. No aceptar elevacion.
+   Si una politica lo bloquea, detener; no cambiar ExecutionPolicy ni usar otro
+   interprete para evadir la politica.
+4. Verificar Python 3.14 x64, instalacion de wheelhouse offline, pip check, informe
+   dependency-check.json, salud HTTP local y que UI abra.
+5. Confirmar escucha solo en loopback 127.0.0.1:8092; no debe exponerse en 0.0.0.0.
+6. Verificar DB/logs/config bajo el perfil del usuario, tarea solo de ese usuario
+   con nivel Limited, o modo de sesion actual si la tarea esta prohibida.
+7. Indexar una carpeta de prueba sintetica con nombres ficticios, validar busquedas,
+   filtro, preview compatible, apertura del archivo y actualizacion del indice.
+8. Reiniciar sesion/equipo segun se permita y revisar persistencia y recuperacion.
+9. Desinstalar siguiendo la politica; conservar o retirar DB solo segun retencion.
+
+ETAPA 5: VALIDACION LAN (PENDIENTE DE ANTIGRAVITY/TI)
+-----------------------------------------------------
+No declarar LAN aprobada hasta completar pruebas presenciales/en red:
+- Confirmar direccion estable, principal, respaldo, proxy, DNS, TLS, puerto y
+  origen web con TI; no asumir 172.23.174.103 / .11.
+- Confirmar servidor principal y respaldo sirven la version aprobada de UI y
+  recursos offline; failover realmente probado en ventana autorizada.
+- Confirmar API de datos cliente a loopback, sin consultas/rutas/previews/results en
+  trafico o logs de principal/proxy.
+- Confirmar APIs de datos bloqueadas remotamente en local_agent, CORS exacto y
+  ausencia de proxy hacia APIs del agente.
+- Probar clientes A/B con indices separados, permisos/carpetas inaccesibles,
+  unidad desconectada/reconectada, reinicios, salud y failover.
+- Medir tiempo de primer escaneo/actualizacion, conteo y pico de memoria.
+- Detener despliegue ante exposicion de datos, bloqueo EDR, elevacion inesperada,
+  perdida DB, indice de otro equipo o falla de failover.
+
+FORMATO DEL INFORME
+-------------------
+Guardar el reporte fuera del paquete distribuible, por ejemplo en una carpeta de
+validacion nueva dentro de dist; no modificar salidas previas. Incluir:
+- Fecha/hora y zona, Codex/host, commit/branch y estado del repo.
+- Hash del ZIP, resultado del sidecar, firma y firmante del runtime.
+- Tabla por etapa/prueba: ID, esperado, observado, PASS/FAIL/BLOCKED, evidencia
+  minimizada y limitaciones.
+- Lista de archivos revisados/modificados y comandos ejecutados.
+- Resultados separados para inspeccion local, instalacion piloto y LAN.
+- Pendientes con responsable sugerido (TI, seguridad, dueño de aplicacion).
+- No adjuntar consultas, rutas reales, DB, tokens, credenciales ni logs con datos
+  personales.
+
+La validacion solo puede concluir que se comprobaron los puntos respaldados por
+evidencia. No usar expresiones de garantia absoluta ni extrapolar resultados de un
+equipo piloto a todos los equipos corporativos.
